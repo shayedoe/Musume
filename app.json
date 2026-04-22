@@ -1,0 +1,28 @@
+{
+  "expo": {
+    "name": "Musume",
+    "slug": "musume",
+    "scheme": "musume",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "plugins": [
+      "expo-router",
+      "expo-image-picker"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.shayedoe.musume",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Use the camera to capture inventory shelf photos.",
+        "NSPhotoLibraryUsageDescription": "Use the photo library to upload inventory shelf photos.",
+        "NSPhotoLibraryAddUsageDescription": "Save exported inventory files when needed."
+      }
+    },
+    "extra": {
+      "eas": {
+        "projectId": "REPLACE_WITH_EAS_PROJECT_ID"
+      }
+    }
+  }
+}
