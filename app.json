@@ -20,6 +20,8 @@
       }
     },
     "extra": {
+      "supabaseUrl": "https://txgcqrymhuiivecpcsnh.supabase.co",
+      "supabaseAnonKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
       "eas": {
         "projectId": "REPLACE_WITH_EAS_PROJECT_ID"
       }
