@@ -31,17 +31,45 @@ create table inventory_sessions (
 
 create table photos (
   id uuid primary key default gen_random_uuid(),
-  session_id uuid references inventory_sessions(id),
-  image_url text
+  session_id uuid references inventory_sessions(id) on delete cascade,
+  image_url text not null
 );
 
 create table final_counts (
   id uuid primary key default gen_random_uuid(),
-  session_id uuid references inventory_sessions(id),
+  session_id uuid references inventory_sessions(id) on delete cascade,
   product text,
   quantity decimal,
   section text
 );
+
+create index photos_session_id_idx on photos(session_id);
+create index final_counts_session_id_idx on final_counts(session_id);
+
+alter table inventory_sessions enable row level security;
+alter table photos enable row level security;
+alter table final_counts enable row level security;
+
+create policy "Allow authenticated users to access inventory_sessions"
+  on inventory_sessions
+  for all
+  to authenticated
+  using (true)
+  with check (true);
+
+create policy "Allow authenticated users to access photos"
+  on photos
+  for all
+  to authenticated
+  using (true)
+  with check (true);
+
+create policy "Allow authenticated users to access final_counts"
+  on final_counts
+  for all
+  to authenticated
+  using (true)
+  with check (true);
 ```
 
 #### Update Configuration
