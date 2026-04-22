@@ -32,25 +32,28 @@ ALTER TABLE inventory_sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE photos ENABLE ROW LEVEL SECURITY;
 ALTER TABLE final_counts ENABLE ROW LEVEL SECURITY;
 
--- Create policies for public access (adjust based on your security needs)
--- For development, you can use these permissive policies
--- For production, you should add authentication and restrict access
+-- Create policies with safer defaults
+-- These policies allow all operations for signed-in users only.
+-- If you need stricter production access, replace these with user/session-scoped policies.
 
 -- Policies for inventory_sessions
-CREATE POLICY "Allow all operations on inventory_sessions"
+CREATE POLICY "Allow authenticated operations on inventory_sessions"
   ON inventory_sessions FOR ALL
+  TO authenticated
   USING (true)
   WITH CHECK (true);
 
 -- Policies for photos
-CREATE POLICY "Allow all operations on photos"
+CREATE POLICY "Allow authenticated operations on photos"
   ON photos FOR ALL
+  TO authenticated
   USING (true)
   WITH CHECK (true);
 
 -- Policies for final_counts
-CREATE POLICY "Allow all operations on final_counts"
+CREATE POLICY "Allow authenticated operations on final_counts"
   ON final_counts FOR ALL
+  TO authenticated
   USING (true)
   WITH CHECK (true);
 
