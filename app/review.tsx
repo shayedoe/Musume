@@ -97,12 +97,24 @@ export default function Review() {
         return
       }
 
+      const parsedCounts = validCounts.map((c: CountItem) => ({
+        ...c,
+        parsedQuantity: parseFloat(c.quantity)
+      }))
+
+      const invalidCount = parsedCounts.find((c) => !Number.isFinite(c.parsedQuantity))
+
+      if (invalidCount) {
+        Alert.alert('Invalid quantity', `Please enter a valid number for ${invalidCount.product || 'the product'} before saving`)
+        return
+      }
+
       const { error } = await supabase
         .from('final_counts')
-        .insert(validCounts.map((c: CountItem) => ({
+        .insert(parsedCounts.map((c) => ({
           session_id,
           product: c.product,
-          quantity: parseFloat(c.quantity),
+          quantity: c.parsedQuantity,
           section: c.section
         })))
 
