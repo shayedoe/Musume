@@ -83,11 +83,12 @@ export default function Review() {
   const saveCounts = async () => {
     try {
       // Delete existing counts
-      await supabase
+      const { error: deleteError } = await supabase
         .from('final_counts')
         .delete()
         .eq('session_id', session_id)
 
+      if (deleteError) throw deleteError
       // Insert new counts
       const validCounts = counts.filter((c: CountItem) => c.product.trim() && c.quantity.trim())
 
