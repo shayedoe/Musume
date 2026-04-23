@@ -108,12 +108,16 @@ export default function Camera() {
       const photoIds: string[] = []
       for (let i = 0; i < shots.length; i++) {
         const shot = shots[i]
-        const response = await fetch(shot.uri)
+        // Force JPEG: fetch the in-memory base64 as a data URL, so the blob
+        // always has type image/jpeg regardless of whether the original asset
+        // was HEIC (iPhone default), HEIF, PNG, etc. ImagePicker returns
+        // base64 as JPEG when quality is set.
+        const response = await fetch(`data:image/jpeg;base64,${shot.base64}`)
         const blob = await response.blob()
         const fileName = `${sessionId}/${Date.now()}_${i}.jpg`
         const { error: uploadError } = await supabase.storage
           .from('inventory-images')
-          .upload(fileName, blob, { contentType: 'image/jpeg' })
+          .upload(fileName, blob, { contentType: 'image/jpeg', upsert: false })
         if (uploadError) throw uploadError
         const { data: urlData } = supabase.storage
           .from('inventory-images')

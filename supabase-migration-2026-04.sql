@@ -55,9 +55,18 @@ END $$;
 
 -- 3. Storage bucket policies for inventory-images (app uses anon key to upload)
 --    These are idempotent.
-INSERT INTO storage.buckets (id, name, public)
-VALUES ('inventory-images', 'inventory-images', true)
-ON CONFLICT (id) DO UPDATE SET public = EXCLUDED.public;
+INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+VALUES (
+  'inventory-images',
+  'inventory-images',
+  true,
+  20971520, -- 20 MB
+  ARRAY['image/jpeg','image/jpg','image/png','image/heic','image/heif','image/webp']
+)
+ON CONFLICT (id) DO UPDATE SET
+  public = EXCLUDED.public,
+  file_size_limit = EXCLUDED.file_size_limit,
+  allowed_mime_types = EXCLUDED.allowed_mime_types;
 
 DROP POLICY IF EXISTS "anon upload inventory images" ON storage.objects;
 CREATE POLICY "anon upload inventory images"
