@@ -156,22 +156,24 @@ export default function Camera() {
       }
 
       setStatus('Saving...')
-      const detectionRows: any[] = []
-      perPhotoDetections.forEach((dets, i) => {
-        const photoId = photoIds[i]
-        for (const d of dets) {
-          const match = matchProduct(d.product, catalog)
-          detectionRows.push({
-            photo_id: photoId,
-            session_id: sessionId,
-            predicted_product: d.product,
-            matched_product_id: match?.id ?? null,
-            count: d.count,
-            fill_level: d.fill_level,
-            confidence: d.confidence ?? null,
-            notes: d.notes ?? null,
-            status: 'pending',
-          })
+      // Merge across photos so duplicates from overlapping shots (or
+      // repeated products across shelves) become a single row with a
+      // summed count — instead of one row per photo per product.
+      const merged = mergeDetections(perPhotoDetections)
+      const detectionRows: any[] = merged.map((d) => {
+        const match = matchProduct(d.product, catalog)
+        return {
+          // photo_id intentionally null on merged rows — the detection
+          // represents an aggregate across multiple photos in the session.
+          photo_id: null,
+          session_id: sessionId,
+          predicted_product: d.product,
+          matched_product_id: match?.id ?? null,
+          count: d.count,
+          fill_level: d.fill_level,
+          confidence: d.confidence ?? null,
+          notes: d.notes ?? null,
+          status: 'pending',
         }
       })
       if (detectionRows.length > 0) {
@@ -181,7 +183,6 @@ export default function Camera() {
         if (detError) throw detError
       }
 
-      const merged = mergeDetections(perPhotoDetections)
       if (warnings.length > 0) {
         Alert.alert('Finished with warnings', warnings.slice(0, 4).join('\n'))
       } else if (merged.length === 0) {

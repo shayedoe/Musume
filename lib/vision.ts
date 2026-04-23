@@ -236,19 +236,27 @@ export async function analyzeShelfImage(
   }
 }
 
-/** Merge detections across multiple photos by product + fill level. */
+/**
+ * Merge detections across multiple photos by (product, fill_level).
+ * Counts SUM across photos — assumption is that a session's photos
+ * cover different shelf sections. If two photos of the same shelf
+ * slightly overlap, a handful of bottles may double-count; the user
+ * can edit the count on the review screen.
+ */
 export function mergeDetections(
   groups: VisionDetectionResult[][]
 ): VisionDetectionResult[] {
   const bucket = new Map<string, VisionDetectionResult>()
   for (const group of groups) {
     for (const d of group) {
-      const key = `${d.product.toLowerCase()}|${d.fill_level}`
+      // Normalize name so "Tito's Vodka" and "tito's vodka " collapse.
+      const normProduct = d.product.trim().replace(/\s+/g, ' ')
+      const key = `${normProduct.toLowerCase()}|${d.fill_level}`
       const existing = bucket.get(key)
       if (!existing) {
-        bucket.set(key, { ...d })
+        bucket.set(key, { ...d, product: normProduct })
       } else {
-        existing.count = Math.max(existing.count, d.count)
+        existing.count += d.count
         if ((d.confidence ?? 0) > (existing.confidence ?? 0)) {
           existing.confidence = d.confidence
         }
