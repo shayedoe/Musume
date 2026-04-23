@@ -500,8 +500,93 @@ interface RoboflowPrediction {
   class_id?: number
 }
 
+/**
+ * Hybrid Roboflow + OpenAI pipeline.
+ *   1. Roboflow detects every bottle's bbox (detection only — no SKU).
+ *   2. For each bbox, crop the original shelf image to just that bottle.
+ *   3. Send the crop + the reference gallery to OpenAI in one call per
+ *      bottle, asking "which reference is this?" — batched in parallel,
+ *      limited to BOTTLE_ID_CONCURRENCY at a time to stay under rate limits.
+ *   4. Aggregate by returned product name.
+ *
+ * If the Roboflow class is richer than just "bottle" (e.g. per-SKU classes),
+ * the class name is preferred over OpenAI identification.
+ */
+const BOTTLE_ID_CONCURRENCY = 6
+const BOTTLE_CROP_PADDING = 0.05 // expand each bbox by 5% so labels aren't clipped
+
+const SKU_ID_PROMPT = `You identify a single bottle in a close-up crop.
+
+You will be given:
+  - A CROP of one bottle from a bar shelf.
+  - A REFERENCE GALLERY of known products, each labeled with a product name.
+
+TASK
+  1. Which reference bottle in the gallery best matches the crop? Match on
+     label artwork, bottle shape, glass color, cap color, and apparent size.
+  2. If NONE of the references match, describe the bottle using whatever
+     label text you can read.
+  3. Estimate the fill level: 1 (full/unopened), 0.5 (about half),
+     0.1 (nearly empty), 0 (empty).
+
+OUTPUT — STRICT JSON only, no prose:
+{
+  "product": "Ilegal Mezcal Joven 750ml",
+  "matched_reference": true,
+  "fill_level": 1,
+  "confidence": 0.9,
+  "notes": "black cap, green glass"
+}`
+
+async function identifyBottleCrop(
+  cropBytes: Uint8Array,
+  inlinedRefs: Array<{ product: string; dataUrl: string }>
+): Promise<{
+  product: string
+  matched_reference: boolean
+  fill_level: number
+  confidence: number
+  notes: string | null
+} | null> {
+  if (!OPENAI_KEY) return null
+  const cropDataUrl = `data:image/jpeg;base64,${bytesToBase64(cropBytes)}`
+
+  const content: any[] = []
+  if (inlinedRefs.length) {
+    content.push({
+      type: 'text',
+      text: `REFERENCE GALLERY (${inlinedRefs.length} known products). If the crop matches one, use that product name verbatim.`,
+    })
+    inlinedRefs.forEach((ref, i) => {
+      content.push({ type: 'text', text: `Reference #${i + 1}: ${ref.product}` })
+      content.push({ type: 'image_url', image_url: { url: ref.dataUrl, detail: 'low' } })
+    })
+  }
+  content.push({ type: 'text', text: 'BOTTLE CROP to identify:' })
+  content.push({ type: 'image_url', image_url: { url: cropDataUrl, detail: 'low' } })
+
+  try {
+    const raw = await callOpenAI([
+      { role: 'system', content: SKU_ID_PROMPT },
+      { role: 'user', content },
+    ])
+    const product = String(raw?.product ?? '').trim()
+    if (!product) return null
+    return {
+      product,
+      matched_reference: !!raw?.matched_reference,
+      fill_level: snapFill(raw?.fill_level ?? 1),
+      confidence: typeof raw?.confidence === 'number' ? raw.confidence : 0.7,
+      notes: raw?.notes ? String(raw.notes) : null,
+    }
+  } catch {
+    return null
+  }
+}
+
 async function detectWithRoboflow(
   imageBase64: string,
+  inlinedRefs: Array<{ product: string; dataUrl: string }>,
   classNameMap: Map<string, string>
 ): Promise<{
   detections: Array<{
@@ -537,47 +622,185 @@ async function detectWithRoboflow(
     ? data.predictions
     : []
 
-  // Aggregate by normalized class name.
+  // Determine whether the Roboflow model is single-class ("bottle") or
+  // multi-class (SKU-level). If single-class, we need to identify each
+  // crop via OpenAI. If multi-class, we trust Roboflow's class labels.
+  const distinctClasses = new Set(preds.map((p) => (p.class ?? '').toLowerCase().trim()))
+  const singleClass =
+    distinctClasses.size <= 1 &&
+    (distinctClasses.has('bottle') || distinctClasses.has(''))
+
+  let identifiedBottles: Array<{
+    product: string
+    fill_level: number
+    confidence: number
+    matched_reference: boolean
+    notes: string | null
+  }> = []
+  let idMeta: Record<string, unknown> = {}
+
+  if (singleClass && preds.length > 0) {
+    // Decode shelf image once, then crop per detection.
+    let shelfImg: Image
+    try {
+      const bytes = base64ToBytes(imageBase64)
+      const decoded = await decode(bytes)
+      if (!(decoded instanceof Image)) throw new Error('unsupported image type')
+      shelfImg = decoded
+    } catch (e: any) {
+      throw new Error(`shelf decode failed: ${String(e).slice(0, 200)}`)
+    }
+    const W = shelfImg.width
+    const H = shelfImg.height
+
+    // Build crop jobs
+    const crops: Array<{ idx: number; bytes: Uint8Array; pred: RoboflowPrediction }> = []
+    for (let i = 0; i < preds.length; i++) {
+      const p = preds[i]
+      // Roboflow returns x,y as bbox CENTER in pixels, width/height in pixels
+      const padW = p.width * BOTTLE_CROP_PADDING
+      const padH = p.height * BOTTLE_CROP_PADDING
+      const x0 = Math.max(0, Math.round(p.x - p.width / 2 - padW))
+      const y0 = Math.max(0, Math.round(p.y - p.height / 2 - padH))
+      const x1 = Math.min(W, Math.round(p.x + p.width / 2 + padW))
+      const y1 = Math.min(H, Math.round(p.y + p.height / 2 + padH))
+      const w = x1 - x0
+      const h = y1 - y0
+      if (w < 20 || h < 40) continue
+      try {
+        const cropImg = shelfImg.clone().crop(x0, y0, w, h)
+        // cap the longer edge to 512 for cheap "low" detail tokens
+        let finalImg = cropImg
+        if (Math.max(cropImg.width, cropImg.height) > 512) {
+          const scale = 512 / Math.max(cropImg.width, cropImg.height)
+          finalImg = cropImg.resize(
+            Math.round(cropImg.width * scale),
+            Math.round(cropImg.height * scale)
+          )
+        }
+        const jpeg = await finalImg.encodeJPEG(80)
+        crops.push({ idx: i, bytes: jpeg, pred: p })
+      } catch {
+        /* skip this crop */
+      }
+    }
+
+    // Parallel identify with concurrency cap
+    const results = new Array<Awaited<ReturnType<typeof identifyBottleCrop>>>(crops.length)
+    let cursor = 0
+    async function worker() {
+      while (true) {
+        const myIdx = cursor++
+        if (myIdx >= crops.length) return
+        results[myIdx] = await identifyBottleCrop(crops[myIdx].bytes, inlinedRefs)
+      }
+    }
+    const workerCount = Math.min(BOTTLE_ID_CONCURRENCY, crops.length)
+    await Promise.all(Array.from({ length: workerCount }, () => worker()))
+
+    let identifiedCount = 0
+    let refMatchCount = 0
+    for (let i = 0; i < crops.length; i++) {
+      const r = results[i]
+      const pred = crops[i].pred
+      if (r) {
+        identifiedCount++
+        if (r.matched_reference) refMatchCount++
+        identifiedBottles.push({
+          product: r.product,
+          fill_level: r.fill_level,
+          confidence: Math.min(pred.confidence ?? 0.7, r.confidence),
+          matched_reference: r.matched_reference,
+          notes: r.notes,
+        })
+      } else {
+        // OpenAI identification failed — keep the bottle but label as "Unknown bottle"
+        identifiedBottles.push({
+          product: 'Unknown bottle',
+          fill_level: 1,
+          confidence: pred.confidence ?? 0.5,
+          matched_reference: false,
+          notes: null,
+        })
+      }
+    }
+    idMeta = {
+      crops: crops.length,
+      identified: identifiedCount,
+      reference_matches: refMatchCount,
+    }
+  } else {
+    // Multi-class model — trust Roboflow classes as-is.
+    for (const p of preds) {
+      const raw = String(p.class ?? '').trim()
+      if (!raw) continue
+      const key = raw.toLowerCase()
+      const pretty = classNameMap.get(key) ?? raw
+      identifiedBottles.push({
+        product: pretty,
+        fill_level: 1,
+        confidence: p.confidence ?? 0.7,
+        matched_reference: classNameMap.has(key),
+        notes: null,
+      })
+    }
+  }
+
+  // Aggregate by (product, fill_level)
   const bucket = new Map<string, {
     product: string
     count: number
+    fill_level: number
     confSum: number
+    matched_reference: boolean
+    notes: string | null
   }>()
-  for (const p of preds) {
-    const raw = String(p.class ?? '').trim()
-    if (!raw) continue
-    const key = raw.toLowerCase()
-    const pretty = classNameMap.get(key) ?? raw
+  for (const b of identifiedBottles) {
+    const key = `${b.product.toLowerCase()}|${b.fill_level}`
     const existing = bucket.get(key)
     if (!existing) {
-      bucket.set(key, { product: pretty, count: 1, confSum: p.confidence ?? 0.7 })
+      bucket.set(key, {
+        product: b.product,
+        count: 1,
+        fill_level: b.fill_level,
+        confSum: b.confidence,
+        matched_reference: b.matched_reference,
+        notes: b.notes,
+      })
     } else {
       existing.count += 1
-      existing.confSum += p.confidence ?? 0.7
+      existing.confSum += b.confidence
+      if (b.matched_reference) existing.matched_reference = true
+      if (!existing.notes && b.notes) existing.notes = b.notes
     }
   }
 
   const detections = Array.from(bucket.values()).map((x) => ({
     product: x.product,
     count: x.count,
-    // Roboflow detection alone can't tell fill level — assume full until a
-    // fill-specific model or per-crop classifier is added.
-    fill_level: 1,
+    fill_level: x.fill_level,
     confidence: Math.round((x.confSum / x.count) * 100) / 100,
-    barcode: null,
-    notes: null as string | null,
+    barcode: null as string | null,
+    notes: x.matched_reference
+      ? x.notes
+        ? `${x.notes} · matched reference`
+        : 'matched reference'
+      : x.notes,
   }))
 
   return {
     detections,
     warnings: preds.length === 0 ? ['roboflow returned no detections'] : [],
     meta: {
-      backend: 'roboflow',
+      backend: singleClass ? 'roboflow+openai-id' : 'roboflow',
       model: ROBOFLOW_MODEL,
       raw_predictions: preds.length,
-      unique_classes: bucket.size,
+      single_class: singleClass,
+      unique_products: bucket.size,
+      reference_count: inlinedRefs.length,
       image: data?.image,
       time: data?.time,
+      ...idMeta,
     },
   }
 }
@@ -616,8 +839,15 @@ Deno.serve(async (req) => {
     for (const name of cat) {
       classNameMap.set(String(name).toLowerCase().replace(/\s+/g, '_'), String(name))
     }
+    // Fetch reference images server-side for SKU identification (single-class
+    // Roboflow models need OpenAI to name each crop).
+    const rfRefs = refs
+      .filter((r) => r && typeof r.product === 'string' && typeof r.image_url === 'string')
+      .slice(0, 25)
+    const inlinedRefs = rfRefs.length ? await fetchReferenceImages(rfRefs) : []
+
     try {
-      const out = await detectWithRoboflow(image, classNameMap)
+      const out = await detectWithRoboflow(image, inlinedRefs, classNameMap)
       return json(out)
     } catch (e: any) {
       // If Roboflow fails, fall through to the OpenAI path so the user
