@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { View, Text, Pressable, Alert, ActivityIndicator, Image, ScrollView } from 'react-native'
 import { useRouter, useLocalSearchParams } from 'expo-router'
 import * as ImagePicker from 'expo-image-picker'
+import * as ImageManipulator from 'expo-image-manipulator'
 import { supabase } from '../lib/supabase'
 import { analyzeShelfImage, mergeDetections } from '../lib/vision'
 import { ensureCatalogSeeded, matchProduct } from '../lib/catalog'
@@ -10,6 +11,19 @@ import type { Product, VisionDetectionResult } from '../lib/types'
 interface LocalShot {
   uri: string
   base64: string
+}
+
+// Re-encode picker output to real JPEG bytes. iPhones save photos as HEIC; even
+// when ImagePicker returns base64 it can still be HEIC-encoded, which OpenAI
+// rejects with "please make sure your image has one of the following formats
+// ['png','jpeg','gif','webp']".
+async function toJpeg(uri: string): Promise<{ uri: string; base64: string }> {
+  const result = await ImageManipulator.manipulateAsync(uri, [{ resize: { width: 1600 } }], {
+    compress: 0.8,
+    format: ImageManipulator.SaveFormat.JPEG,
+    base64: true,
+  })
+  return { uri: result.uri, base64: result.base64 ?? '' }
 }
 
 export default function Camera() {
@@ -36,11 +50,12 @@ export default function Camera() {
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
       allowsEditing: false,
       quality: 0.7,
-      base64: true,
+      base64: false,
     })
     if (!result.canceled && result.assets[0]) {
       const a = result.assets[0]
-      if (a.base64) setShots((prev) => [...prev, { uri: a.uri, base64: a.base64! }])
+      const jpeg = await toJpeg(a.uri)
+      if (jpeg.base64) setShots((prev) => [...prev, jpeg])
     }
   }
 
@@ -54,15 +69,22 @@ export default function Camera() {
       mediaTypes: ImagePicker.MediaTypeOptions.Images,
       allowsEditing: false,
       quality: 0.7,
-      base64: true,
+      base64: false,
       allowsMultipleSelection: true,
       selectionLimit: 6,
     })
     if (!result.canceled) {
-      const next = result.assets
-        .filter((a) => !!a.base64)
-        .map((a) => ({ uri: a.uri, base64: a.base64! }))
-      setShots((prev) => [...prev, ...next])
+      setStatus('Converting images...')
+      try {
+        const next: LocalShot[] = []
+        for (const a of result.assets) {
+          const jpeg = await toJpeg(a.uri)
+          if (jpeg.base64) next.push(jpeg)
+        }
+        setShots((prev) => [...prev, ...next])
+      } finally {
+        setStatus('')
+      }
     }
   }
 
