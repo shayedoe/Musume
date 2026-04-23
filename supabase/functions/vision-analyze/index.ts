@@ -38,6 +38,14 @@ const OPENAI_KEY = Deno.env.get('OPENAI_API_KEY')
 const MODEL = Deno.env.get('OPENAI_VISION_MODEL') ?? 'gpt-4o'
 const DEFAULT_GRID = Deno.env.get('VISION_TILE_GRID') ?? '2x2'
 const SELF_VERIFY_DEFAULT = (Deno.env.get('VISION_SELF_VERIFY') ?? '0') === '1'
+
+// Roboflow hosted detector (preferred when ROBOFLOW_MODEL is set).
+// ROBOFLOW_MODEL format: "<project-slug>/<version>"  e.g. "musume/1"
+// Set via:  supabase secrets set ROBOFLOW_MODEL=musume/1
+const ROBOFLOW_MODEL = Deno.env.get('ROBOFLOW_MODEL')
+const ROBOFLOW_API_KEY = Deno.env.get('ROBOFLOW_API_KEY')
+const ROBOFLOW_CONFIDENCE = parseFloat(Deno.env.get('ROBOFLOW_CONFIDENCE') ?? '0.4')
+const ROBOFLOW_OVERLAP = parseFloat(Deno.env.get('ROBOFLOW_OVERLAP') ?? '0.3')
 const TILE_OVERLAP = 0.1 // 10% overlap so bottles on seams still get counted in at least one tile
 
 const SYSTEM_PROMPT = `You are a meticulous bar/stock-room inventory counter.
@@ -475,10 +483,108 @@ function parseGrid(value: string | undefined): { cols: number; rows: number } {
   return { cols, rows }
 }
 
+// ---------------- Roboflow hosted detection path ----------------
+// When ROBOFLOW_MODEL is set we prefer a trained custom detector over
+// the OpenAI tiled pipeline. Roboflow returns bounding boxes with class
+// labels + per-box confidence; we aggregate by class name. If the class
+// name matches an entry in the `bottle_references` or catalog, we use
+// that pretty name; otherwise we fall back to the raw class string.
+
+interface RoboflowPrediction {
+  x: number
+  y: number
+  width: number
+  height: number
+  confidence: number
+  class: string
+  class_id?: number
+}
+
+async function detectWithRoboflow(
+  imageBase64: string,
+  classNameMap: Map<string, string>
+): Promise<{
+  detections: Array<{
+    product: string
+    count: number
+    fill_level: number
+    confidence: number
+    barcode: string | null
+    notes: string | null
+  }>
+  warnings: string[]
+  meta: Record<string, unknown>
+}> {
+  const url =
+    `https://detect.roboflow.com/${ROBOFLOW_MODEL}` +
+    `?api_key=${ROBOFLOW_API_KEY}` +
+    `&confidence=${Math.round(ROBOFLOW_CONFIDENCE * 100)}` +
+    `&overlap=${Math.round(ROBOFLOW_OVERLAP * 100)}` +
+    `&format=json`
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: imageBase64,
+    signal: AbortSignal.timeout(25_000),
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`roboflow ${res.status}: ${text.slice(0, 300)}`)
+  }
+  const data = await res.json()
+  const preds: RoboflowPrediction[] = Array.isArray(data?.predictions)
+    ? data.predictions
+    : []
+
+  // Aggregate by normalized class name.
+  const bucket = new Map<string, {
+    product: string
+    count: number
+    confSum: number
+  }>()
+  for (const p of preds) {
+    const raw = String(p.class ?? '').trim()
+    if (!raw) continue
+    const key = raw.toLowerCase()
+    const pretty = classNameMap.get(key) ?? raw
+    const existing = bucket.get(key)
+    if (!existing) {
+      bucket.set(key, { product: pretty, count: 1, confSum: p.confidence ?? 0.7 })
+    } else {
+      existing.count += 1
+      existing.confSum += p.confidence ?? 0.7
+    }
+  }
+
+  const detections = Array.from(bucket.values()).map((x) => ({
+    product: x.product,
+    count: x.count,
+    // Roboflow detection alone can't tell fill level — assume full until a
+    // fill-specific model or per-crop classifier is added.
+    fill_level: 1,
+    confidence: Math.round((x.confSum / x.count) * 100) / 100,
+    barcode: null,
+    notes: null as string | null,
+  }))
+
+  return {
+    detections,
+    warnings: preds.length === 0 ? ['roboflow returned no detections'] : [],
+    meta: {
+      backend: 'roboflow',
+      model: ROBOFLOW_MODEL,
+      raw_predictions: preds.length,
+      unique_classes: bucket.size,
+      image: data?.image,
+      time: data?.time,
+    },
+  }
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS_HEADERS })
   if (req.method !== 'POST') return json({ error: 'method not allowed' }, 405)
-  if (!OPENAI_KEY) return json({ error: 'OPENAI_API_KEY not configured' }, 500)
 
   let payload: {
     image_base64?: string
@@ -496,6 +602,32 @@ Deno.serve(async (req) => {
   const image = payload.image_base64
   if (!image || typeof image !== 'string') return json({ error: 'image_base64 required' }, 400)
   if (image.length > 14_000_000) return json({ error: 'image too large' }, 413)
+
+  // ---- Roboflow path (preferred when model is configured) ----
+  if (ROBOFLOW_MODEL && ROBOFLOW_API_KEY) {
+    // Build a class-slug -> pretty-product-name map from the request's
+    // reference list + catalog so "titos_vodka" renders as "Tito's Vodka".
+    const classNameMap = new Map<string, string>()
+    const refs = Array.isArray(payload.references) ? payload.references : []
+    for (const r of refs) {
+      if (r?.product) classNameMap.set(r.product.toLowerCase().replace(/\s+/g, '_'), r.product)
+    }
+    const cat = Array.isArray(payload.catalog) ? payload.catalog : []
+    for (const name of cat) {
+      classNameMap.set(String(name).toLowerCase().replace(/\s+/g, '_'), String(name))
+    }
+    try {
+      const out = await detectWithRoboflow(image, classNameMap)
+      return json(out)
+    } catch (e: any) {
+      // If Roboflow fails, fall through to the OpenAI path so the user
+      // still gets a result rather than a hard error.
+      console.warn('[vision-analyze] roboflow failed, falling back to openai:', String(e))
+    }
+  }
+
+  // ---- OpenAI tiled path (fallback / when no Roboflow model yet) ----
+  if (!OPENAI_KEY) return json({ error: 'OPENAI_API_KEY not configured' }, 500)
 
   const catalog = Array.isArray(payload.catalog) ? payload.catalog.slice(0, 500) : []
   const catalogLine = catalog.length
