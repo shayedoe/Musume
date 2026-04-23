@@ -654,6 +654,7 @@ function AnnotatedPhoto({
   const [showOverlay, setShowOverlay] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [retried, setRetried] = useState(false)
+  const [selected, setSelected] = useState<number | null>(null)
   const W = 300
   const H = 400
 
@@ -761,55 +762,83 @@ function AnnotatedPhoto({
           const width = bw * scaleX
           const height = bh * scaleY
           const color = STATUS_COLORS[a.status] ?? STATUS_COLORS.unknown
-          // Filled translucent bottle-shaped mask: a rounded neck on top
-          // plus a body. Opacity is intentionally low so the underlying
-          // photo stays visible even when many bottles overlap.
-          const neckH = Math.max(6, height * 0.22)
-          const neckW = Math.max(4, width * 0.38)
-          const neckX = left + (width - neckW) / 2
-          const bodyTop = top + neckH * 0.75
-          const bodyH = height - neckH * 0.75
           return (
-            <View key={i} pointerEvents="none">
-              {/* Neck */}
-              <View
-                style={{
-                  position: 'absolute',
-                  left: neckX,
-                  top,
-                  width: neckW,
-                  height: neckH,
-                  backgroundColor: color,
-                  opacity: 0.18,
-                  borderTopLeftRadius: 3,
-                  borderTopRightRadius: 3,
-                  borderWidth: 1,
-                  borderColor: color,
-                }}
-              />
-              {/* Body */}
-              <View
-                style={{
-                  position: 'absolute',
-                  left,
-                  top: bodyTop,
-                  width,
-                  height: bodyH,
-                  backgroundColor: color,
-                  opacity: 0.18,
-                  borderRadius: Math.min(width, bodyH) * 0.18,
-                  borderWidth: 1.5,
-                  borderColor: color,
-                }}
-              />
-            </View>
+            <Pressable
+              key={i}
+              onPress={() => setSelected(i)}
+              style={{
+                position: 'absolute',
+                left,
+                top,
+                width,
+                height,
+                borderWidth: 2,
+                borderColor: color,
+                backgroundColor: color,
+                opacity: 0.35,
+                borderRadius: 3,
+              }}
+            />
           )
         })}
-      {/* Tap to toggle overlay so you can confirm the photo loaded. */}
-      <Pressable
-        onPress={() => setShowOverlay((v) => !v)}
-        style={{ position: 'absolute', left: 0, top: 0, right: 0, bottom: 0 }}
-      />
+      {/* Popup: tap a bottle, see its identity; tap backdrop to dismiss. */}
+      {selected !== null && annotations[selected] && (
+        <Pressable
+          onPress={() => setSelected(null)}
+          style={{
+            position: 'absolute',
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+            backgroundColor: 'rgba(0,0,0,0.55)',
+            justifyContent: 'center',
+            alignItems: 'center',
+            padding: 12,
+          }}
+        >
+          <View
+            style={{
+              backgroundColor: '#1f2937',
+              borderRadius: 10,
+              padding: 14,
+              maxWidth: W - 24,
+              borderWidth: 2,
+              borderColor:
+                STATUS_COLORS[annotations[selected].status] ??
+                STATUS_COLORS.unknown,
+            }}
+          >
+            <Text
+              style={{ color: '#fff', fontSize: 14, fontWeight: '700' }}
+              numberOfLines={3}
+            >
+              {annotations[selected].product}
+            </Text>
+            <Text style={{ color: '#9ca3af', fontSize: 11, marginTop: 4 }}>
+              {annotations[selected].status} ·{' '}
+              {Math.round((annotations[selected].confidence ?? 0) * 100)}%
+            </Text>
+            <Text style={{ color: '#6b7280', fontSize: 10, marginTop: 6 }}>
+              Tap outside to close
+            </Text>
+          </View>
+        </Pressable>
+      )}
+      {/* Toggle overlay by tapping empty background area (only when no popup). */}
+      {selected === null && (
+        <Pressable
+          onPress={() => setShowOverlay((v) => !v)}
+          style={{
+            position: 'absolute',
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+            zIndex: -1,
+          }}
+        />
+      )}
       {loadError && (
         <View
           style={{
