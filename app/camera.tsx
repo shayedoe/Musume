@@ -225,7 +225,15 @@ export default function Camera() {
 
       router.push(`/review?session_id=${sessionId}`)
     } catch (error: any) {
-      Alert.alert('Error', error.message || 'Failed to process session')
+      const msg =
+        (typeof error === 'string' && error) ||
+        error?.message ||
+        error?.error_description ||
+        error?.code ||
+        (error ? JSON.stringify(error).slice(0, 300) : '') ||
+        'Failed to process session'
+      console.error('[camera.analyzeAndUpload]', error)
+      Alert.alert('Error', msg)
     } finally {
       setBusy(false)
       setStatus('')

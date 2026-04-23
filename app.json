@@ -29,7 +29,8 @@
         "NSPhotoLibraryUsageDescription": "Use the photo library to upload inventory shelf photos.",
         "NSPhotoLibraryAddUsageDescription": "Save exported inventory files when needed.",
         "ITSAppUsesNonExemptEncryption": false
-      }
+      },
+      "buildNumber": "2"
     },
     "android": {
       "package": "com.shayedoe.musume",

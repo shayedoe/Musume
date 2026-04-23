@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   View,
   Text,
@@ -649,29 +649,62 @@ function AnnotatedPhoto({
   url: string
   annotations: BottleAnnotation[]
 }) {
+  const [resolvedUrl, setResolvedUrl] = useState<string>(url)
   const [dims, setDims] = useState<{ w: number; h: number } | null>(null)
   const [showOverlay, setShowOverlay] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
+  const [retried, setRetried] = useState(false)
   const W = 300
   const H = 400
+
+  // If the public URL fails (private bucket), fall back to a 1-hour signed URL.
+  const trySignedUrl = useCallback(async (): Promise<string | null> => {
+    try {
+      // public URL shape: <base>/storage/v1/object/public/<bucket>/<path>
+      const m = url.match(/\/object\/public\/([^/]+)\/(.+)$/)
+      if (!m) return null
+      const [, bucket, path] = m
+      const { data, error } = await supabase.storage
+        .from(bucket)
+        .createSignedUrl(decodeURIComponent(path), 3600)
+      if (error || !data?.signedUrl) return null
+      return data.signedUrl
+    } catch {
+      return null
+    }
+  }, [url])
 
   // Eagerly fetch the image dimensions so the overlay aligns even if
   // <Image onLoad> doesn't surface them on this platform.
   useEffect(() => {
     let cancelled = false
     Image.getSize(
-      url,
+      resolvedUrl,
       (w, h) => {
-        if (!cancelled) setDims({ w, h })
+        if (!cancelled) {
+          setDims({ w, h })
+          setLoadError(null)
+        }
       },
-      (err) => {
-        if (!cancelled) setLoadError(String((err as any)?.message ?? err ?? 'load failed'))
+      async (err) => {
+        if (cancelled) return
+        // Auto-retry once with a signed URL in case the bucket is private.
+        if (!retried) {
+          setRetried(true)
+          const signed = await trySignedUrl()
+          if (signed && !cancelled) {
+            setResolvedUrl(signed)
+            return
+          }
+        }
+        const msg = typeof err === 'string' ? err : (err as any)?.message ?? 'image failed to load'
+        setLoadError(String(msg))
       }
     )
     return () => {
       cancelled = true
     }
-  }, [url])
+  }, [resolvedUrl, retried, trySignedUrl])
 
   // Compute the visible rect of the image. We use `contain` so the full
   // photo is always visible (no cropping), then letterbox the remainder.
@@ -698,7 +731,7 @@ function AnnotatedPhoto({
       }}
     >
       <Image
-        source={{ uri: url }}
+        source={{ uri: resolvedUrl }}
         style={{ width: W, height: H }}
         resizeMode="contain"
         onLoad={(e) => {
@@ -707,9 +740,18 @@ function AnnotatedPhoto({
             setDims({ w: src.width, h: src.height })
           }
         }}
-        onError={(e) =>
+        onError={async (e) => {
+          // Same private-bucket fallback as Image.getSize.
+          if (!retried) {
+            setRetried(true)
+            const signed = await trySignedUrl()
+            if (signed) {
+              setResolvedUrl(signed)
+              return
+            }
+          }
           setLoadError(String(e?.nativeEvent?.error ?? 'image failed to load'))
-        }
+        }}
       />
       {showOverlay &&
         annotations.map((a, i) => {
