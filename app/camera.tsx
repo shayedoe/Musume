@@ -32,6 +32,34 @@ async function toJpeg(uri: string): Promise<{ uri: string; base64: string }> {
   return { uri: result.uri, base64: result.base64 ?? '' }
 }
 
+// Decode a base64 string to a Uint8Array without relying on Blob/atob.
+// Works in React Native where `fetch('data:...').blob()` produces a 0-byte
+// blob on iOS and `atob` is not always polyfilled.
+function base64ToUint8Array(b64: string): Uint8Array {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  const lookup = new Uint8Array(256)
+  for (let i = 0; i < chars.length; i++) lookup[chars.charCodeAt(i)] = i
+  // Strip data-URL prefix and any whitespace/newlines.
+  const clean = b64.replace(/^data:.*?;base64,/, '').replace(/\s+/g, '')
+  let len = clean.length
+  let padding = 0
+  if (len >= 1 && clean[len - 1] === '=') padding++
+  if (len >= 2 && clean[len - 2] === '=') padding++
+  const byteLen = (len * 3) / 4 - padding
+  const bytes = new Uint8Array(byteLen)
+  let p = 0
+  for (let i = 0; i < len; i += 4) {
+    const e1 = lookup[clean.charCodeAt(i)]
+    const e2 = lookup[clean.charCodeAt(i + 1)]
+    const e3 = lookup[clean.charCodeAt(i + 2)]
+    const e4 = lookup[clean.charCodeAt(i + 3)]
+    if (p < byteLen) bytes[p++] = (e1 << 2) | (e2 >> 4)
+    if (p < byteLen) bytes[p++] = ((e2 & 15) << 4) | (e3 >> 2)
+    if (p < byteLen) bytes[p++] = ((e3 & 3) << 6) | (e4 & 63)
+  }
+  return bytes
+}
+
 export default function Camera() {
   const router = useRouter()
   const { mode, session_id } = useLocalSearchParams<{ mode?: string; session_id?: string }>()
@@ -158,12 +186,14 @@ export default function Camera() {
       setStatus('Uploading photos...')
       for (let i = 0; i < shots.length; i++) {
         const shot = shots[i]
-        const response = await fetch(`data:image/jpeg;base64,${shot.base64}`)
-        const blob = await response.blob()
+        // React Native's fetch('data:...').blob() produces a 0-byte blob on
+        // iOS, which silently uploads a broken file. Decode the base64 to a
+        // Uint8Array and upload the raw bytes instead.
+        const bytes = base64ToUint8Array(shot.base64)
         const fileName = `${sessionId}/${Date.now()}_${i}.jpg`
         const { error: uploadError } = await supabase.storage
           .from('inventory-images')
-          .upload(fileName, blob, { contentType: 'image/jpeg', upsert: false })
+          .upload(fileName, bytes, { contentType: 'image/jpeg', upsert: false })
         if (uploadError) throw uploadError
         const { data: urlData } = supabase.storage
           .from('inventory-images')
