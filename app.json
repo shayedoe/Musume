@@ -30,7 +30,7 @@
     },
     "extra": {
       "supabaseUrl": "https://txgcqrymhuiivecpcsnh.supabase.co",
-      "supabaseAnonKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+      "supabaseAnonKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR4Z2NxcnltaHVpaXZlY3Bjc25oIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzY4ODkxOTgsImV4cCI6MjA5MjQ2NTE5OH0.awposFkfgfDE76ZbXYkGJJBk9TZC22_f6YOrynHwllA",
       "visionEndpoint": "https://txgcqrymhuiivecpcsnh.functions.supabase.co/vision-analyze",
       "router": {
         "origin": false
