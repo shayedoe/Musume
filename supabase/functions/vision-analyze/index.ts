@@ -6,82 +6,86 @@
 //   image_base64: string,
 //   catalog?: string[],
 //   references?: [{ product, image_url }],
+//   tile_grid?: "1x1" | "2x2" | "3x3",   // override per request
 //   skip_verify?: boolean
 // }
-// Response: { detections: [...], warnings: [...], meta: {...} }
+// Response: { detections, warnings, meta }
 //
-// Accuracy strategy (2026-04):
-//   1. Per-bottle enumeration — we ask the model to list EVERY individual
-//      bottle it sees (one array entry per physical bottle), not aggregate
-//      counts. We aggregate deterministically in code. This eliminates the
-//      "round number bias" LLMs show when asked for counts directly.
-//   2. Shelf-row anchoring — each bottle carries shelf_row + position
-//      ("left/center/right") + depth ("front/back") which forces systematic
-//      scanning and makes duplicates easier to detect.
-//   3. Self-verification pass — after the first call we send the answer
-//      back with a "what did you miss or double-count?" prompt. Additions
-//      are merged (deduped by key); flagged duplicates are removed.
-//      Opt-out via VISION_SELF_VERIFY=0 or request { skip_verify: true }.
-//   4. Reference gallery inlined as base64 data URLs so OpenAI doesn't need
-//      to reach Supabase storage.
+// ACCURACY STRATEGY (2026-04, iteration 3)
+// ----------------------------------------------------------------
+// The big miss before was that a single vision call on a whole shelf
+// systematically collapses multiples ("I see Tito's" — count=1, done).
+// Commercial shelf-recognition systems (Trax, Planorama, Scandit) solve
+// this with REGION DETECTION: tile the shelf into smaller crops, run
+// detection per tile, aggregate. We do the same here.
+//
+// 1) TILING — decode the shelf JPEG server-side with ImageScript, slice
+//    into a grid (default 2x2 with ~10% overlap), and run an independent
+//    per-bottle enumeration on each tile + on the full frame.
+// 2) BOUNDING BOXES — every bottle the model returns must carry a
+//    normalized [x,y,w,h] bbox in tile-local coords. We translate back
+//    to global coords, then dedupe across tiles by IoU + product name.
+// 3) REFERENCE GALLERY — still inlined as base64 data URLs (past fix for
+//    OpenAI's "failed to download" errors on Supabase storage).
+// 4) NO MORE SELF-VERIFY BY DEFAULT — tiling does that job better.
+// ----------------------------------------------------------------
 
 // deno-lint-ignore-file no-explicit-any
 import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
+import { decode, Image } from 'https://deno.land/x/imagescript@1.2.17/mod.ts'
 
 const OPENAI_KEY = Deno.env.get('OPENAI_API_KEY')
 const MODEL = Deno.env.get('OPENAI_VISION_MODEL') ?? 'gpt-4o'
-const SELF_VERIFY = (Deno.env.get('VISION_SELF_VERIFY') ?? '1') !== '0'
+const DEFAULT_GRID = Deno.env.get('VISION_TILE_GRID') ?? '2x2'
+const SELF_VERIFY_DEFAULT = (Deno.env.get('VISION_SELF_VERIFY') ?? '0') === '1'
+const TILE_OVERLAP = 0.1 // 10% overlap so bottles on seams still get counted in at least one tile
 
 const SYSTEM_PROMPT = `You are a meticulous bar/stock-room inventory counter.
 
 GOAL
-Given a SHELF photo (the target) and optionally a REFERENCE GALLERY of
-individual bottle photos (known products, each labeled with a product name),
-enumerate EVERY visible bottle in the shelf photo as its own record.
+Given a CROP of a shelf photo (the target) and optionally a REFERENCE GALLERY
+of individual bottle photos, list EVERY visible bottle in the crop as its own
+record with a bounding box.
 
-CRITICAL: DO NOT AGGREGATE. LIST EVERY BOTTLE INDIVIDUALLY.
-You must produce ONE array entry per physical bottle you see in the photo.
-If there are twelve bottles of Tito's on the top shelf, you return TWELVE
-separate entries (not one entry with count=12). Aggregation is done by
-downstream code, not by you.
+ABSOLUTE RULES
+  (R1) ONE ENTRY PER PHYSICAL BOTTLE. Never aggregate.
+       If you see 7 identical bottles of Tito's, bottles[] has 7 entries.
+       Aggregation is done downstream — never by you.
+  (R2) EVERY ENTRY NEEDS A BOUNDING BOX in normalized tile-local coords.
+       bbox = [x, y, w, h], all in [0,1], where (x,y) is top-left of the
+       bottle and (w,h) is its size, relative to the crop you were shown.
+       If two of your entries have nearly identical bboxes, you are
+       double-counting the SAME physical bottle — delete one.
+  (R3) Different bboxes with the same product name are DIFFERENT physical
+       bottles and must all remain. Do NOT merge them.
 
-HOW TO USE THE REFERENCE GALLERY
+REFERENCE GALLERY (when provided)
   - Each reference image shows ONE bottle of a known product with its name.
   - When a shelf bottle visually matches a reference (same label artwork,
     bottle shape, glass color, cap color), COPY THE REFERENCE'S EXACT
     product name verbatim and set matched_reference = true.
-  - The reference gallery is your ground-truth naming. Prefer reference
-    names over guesses based on partial labels.
-  - If a shelf bottle does NOT match any reference, describe it using
-    whatever label text is readable.
+  - Prefer reference names over guesses based on partial labels.
 
-SCANNING PROCEDURE (follow in order)
-  1. Count shelf rows from top to bottom and label them: shelf_row = 1 for
-     the top shelf, 2 for the next, etc. If the photo shows only a single
-     row/surface, use shelf_row = 1 for all bottles.
-  2. For each shelf_row, scan left to right, front row first, then the row
-     directly behind it. Every bottle whose label OR silhouette is visible
-     gets its own entry. Bottles partially occluded still count.
-  3. For each bottle, set position = "left" | "center" | "right" describing
-     its approximate horizontal location on its shelf. Use depth = "front"
-     or "back" if you can tell which row it's in.
-  4. Two bottles are the SAME product when they share brand/label artwork,
-     bottle shape, glass color, cap color, AND apparent size. If any of
-     those differ, they are separate products — name them differently.
+PROCEDURE
+  1. Scan the crop systematically: top-to-bottom, left-to-right, front row
+     first, then back row. Partially occluded bottles still count if you
+     can see enough to identify them.
+  2. Two bottles are the SAME PRODUCT when they share brand/label artwork,
+     bottle shape, glass color, cap color, AND apparent size. Anything
+     that differs makes them different products — name them differently.
+  3. For every bottle, produce a bbox tight around its visible silhouette.
 
 FILL LEVEL
-For each bottle, one of: 1 (full/unopened), 0.5 (about half), 0.1 (nearly
-empty), 0 (empty). When in doubt for an unopened-looking bottle, use 1.
+For each bottle one of: 1 (full/unopened), 0.5 (about half), 0.1 (nearly
+empty), 0 (empty). When in doubt for an unopened bottle use 1.
 
-OUTPUT — ONE ENTRY PER PHYSICAL BOTTLE
+OUTPUT — one entry per physical bottle, STRICT JSON only:
 {
   "bottles": [
     {
       "product": "Ilegal Mezcal Joven 750ml",
+      "bbox": [0.12, 0.30, 0.07, 0.55],
       "fill_level": 1,
-      "shelf_row": 1,
-      "position": "left",
-      "depth": "front",
       "confidence": 0.9,
       "matched_reference": true,
       "barcode": null,
@@ -90,34 +94,7 @@ OUTPUT — ONE ENTRY PER PHYSICAL BOTTLE
   ],
   "warnings": []
 }
-
-Before returning, count the array length and mentally confirm it matches
-the total bottles visible in the shelf photo. Return STRICT JSON only, no
-prose, no markdown.`
-
-const VERIFY_PROMPT = `You previously produced an inventory of a shelf photo.
-Re-examine the same shelf photo with fresh eyes. Your ONLY job now is to
-find errors in the prior answer.
-
-Look specifically for:
-  (a) Bottles you missed — partially occluded bottles, back-row bottles,
-      bottles at the edges of the image, twins of products you already
-      identified but on a different shelf or position.
-  (b) Duplicates you double-counted — the same physical bottle that was
-      entered twice (e.g. once under a descriptive name and once under a
-      reference name). Bottles that appear identical AND share the same
-      shelf_row AND position are almost certainly duplicates.
-
-Return STRICT JSON:
-{
-  "additional_bottles": [ /* same schema as a bottle entry */ ],
-  "remove_indices":    [ /* 0-based indices from the prior bottles[]
-                           array that should be removed as duplicates */ ]
-}
-
-If the prior answer is perfect, return
-{ "additional_bottles": [], "remove_indices": [] }.
-No prose, no markdown, JSON only.`
+No prose, no markdown.`
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -132,16 +109,19 @@ function json(body: unknown, status = 200): Response {
   })
 }
 
-interface BottleEntry {
+interface GlobalBottle {
   product: string
   fill_level: number
-  shelf_row?: number
-  position?: string
-  depth?: string
-  confidence?: number
-  matched_reference?: boolean
-  barcode?: string | null
-  notes?: string | null
+  confidence: number
+  matched_reference: boolean
+  barcode: string | null
+  notes: string | null
+  // global normalized bbox (relative to the full, pre-tile image)
+  gx: number
+  gy: number
+  gw: number
+  gh: number
+  source_tile: string
 }
 
 function snapFill(v: unknown): number {
@@ -160,82 +140,90 @@ function snapFill(v: unknown): number {
   return best
 }
 
-function normalizeBottle(raw: any): BottleEntry | null {
-  if (!raw || typeof raw !== 'object') return null
-  const product = String(raw.product ?? raw.name ?? '').trim()
-  if (!product) return null
-  return {
-    product,
-    fill_level: snapFill(raw.fill_level ?? raw.fill ?? 1),
-    shelf_row: typeof raw.shelf_row === 'number' ? raw.shelf_row : undefined,
-    position: typeof raw.position === 'string' ? raw.position : undefined,
-    depth: typeof raw.depth === 'string' ? raw.depth : undefined,
-    confidence: typeof raw.confidence === 'number' ? raw.confidence : undefined,
-    matched_reference: !!raw.matched_reference,
-    barcode: raw.barcode ? String(raw.barcode) : null,
-    notes: raw.notes ? String(raw.notes) : null,
+// --- base64 helpers for large binary (avoid String.fromCharCode stack blowup) ---
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = ''
+  const chunk = 0x8000
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk))
   }
+  return btoa(binary)
+}
+function base64ToBytes(b64: string): Uint8Array {
+  const binary = atob(b64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
 }
 
-/** Aggregate per-bottle list into (product × fill_level) detection rows. */
-function aggregate(bottles: BottleEntry[]) {
-  const bucket = new Map<string, {
-    product: string
-    count: number
-    fill_level: number
-    confidenceSum: number
-    confidenceCount: number
-    barcode: string | null
-    notes: string | null
-    matched_reference: boolean
-  }>()
-  for (const b of bottles) {
-    const key = `${b.product.toLowerCase()}|${b.fill_level}`
-    const existing = bucket.get(key)
-    if (!existing) {
-      bucket.set(key, {
-        product: b.product,
-        count: 1,
-        fill_level: b.fill_level,
-        confidenceSum: b.confidence ?? 0.7,
-        confidenceCount: 1,
-        barcode: b.barcode ?? null,
-        notes: b.notes ?? null,
-        matched_reference: !!b.matched_reference,
+interface Tile {
+  id: string
+  // normalized offsets + size in the full image frame
+  ox: number
+  oy: number
+  ow: number
+  oh: number
+  base64: string
+  mime: string
+}
+
+/**
+ * Decode a JPEG (or PNG), optionally downscale, slice into a grid of tiles
+ * with small overlap. Returns the tile base64 blobs + metadata for
+ * coordinate back-transform.
+ */
+async function tileImage(
+  originalBytes: Uint8Array,
+  grid: { cols: number; rows: number }
+): Promise<Tile[]> {
+  const decoded = await decode(originalBytes)
+  if (!(decoded instanceof Image)) {
+    throw new Error('only static images supported (no GIF/animated)')
+  }
+  // Downscale if the long edge > 2048 to keep tile encoding fast.
+  let img = decoded
+  const maxEdge = 2048
+  if (Math.max(img.width, img.height) > maxEdge) {
+    const scale = maxEdge / Math.max(img.width, img.height)
+    img = img.resize(Math.round(img.width * scale), Math.round(img.height * scale))
+  }
+
+  const { cols, rows } = grid
+  // Single-tile fast path — no re-encoding needed if grid is 1x1 and we
+  // didn't resize; otherwise encode a single full tile.
+  const tiles: Tile[] = []
+  const W = img.width
+  const H = img.height
+
+  // size of each cell without overlap
+  const cellW = W / cols
+  const cellH = H / rows
+  const padW = cols > 1 ? cellW * TILE_OVERLAP : 0
+  const padH = rows > 1 ? cellH * TILE_OVERLAP : 0
+
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const x0 = Math.max(0, Math.round(c * cellW - padW))
+      const y0 = Math.max(0, Math.round(r * cellH - padH))
+      const x1 = Math.min(W, Math.round((c + 1) * cellW + padW))
+      const y1 = Math.min(H, Math.round((r + 1) * cellH + padH))
+      const tw = x1 - x0
+      const th = y1 - y0
+      if (tw <= 0 || th <= 0) continue
+      const tile = img.clone().crop(x0, y0, tw, th)
+      const jpeg = await tile.encodeJPEG(85)
+      tiles.push({
+        id: `r${r + 1}c${c + 1}`,
+        ox: x0 / W,
+        oy: y0 / H,
+        ow: tw / W,
+        oh: th / H,
+        base64: bytesToBase64(jpeg),
+        mime: 'image/jpeg',
       })
-    } else {
-      existing.count += 1
-      existing.confidenceSum += b.confidence ?? 0.7
-      existing.confidenceCount += 1
-      if (!existing.barcode && b.barcode) existing.barcode = b.barcode
-      if (b.matched_reference) existing.matched_reference = true
     }
   }
-  return Array.from(bucket.values()).map((x) => ({
-    product: x.product,
-    count: x.count,
-    fill_level: x.fill_level,
-    confidence: Math.round((x.confidenceSum / x.confidenceCount) * 100) / 100,
-    barcode: x.barcode,
-    notes: x.notes
-      ? x.matched_reference
-        ? `${x.notes} · matched reference`
-        : x.notes
-      : x.matched_reference
-        ? 'matched reference'
-        : null,
-  }))
-}
-
-/** Cheap per-bottle identity for dedup between primary + verify bottles. */
-function bottleKey(b: BottleEntry): string {
-  return [
-    b.product.toLowerCase(),
-    b.fill_level,
-    b.shelf_row ?? '',
-    (b.position ?? '').toLowerCase(),
-    (b.depth ?? '').toLowerCase(),
-  ].join('|')
+  return tiles
 }
 
 async function fetchReferenceImages(
@@ -254,9 +242,7 @@ async function fetchReferenceImages(
         if (!ct.startsWith('image/')) return null
         const bytes = new Uint8Array(await r.arrayBuffer())
         if (bytes.byteLength < 500 || bytes.byteLength > 4_000_000) return null
-        let binary = ''
-        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
-        const b64 = btoa(binary)
+        const b64 = bytesToBase64(bytes)
         return { product: ref.product, dataUrl: `data:${ct};base64,${b64}` }
       } catch {
         return null
@@ -302,6 +288,193 @@ async function callOpenAI(messages: any[]): Promise<any> {
   return parseJson(data?.choices?.[0]?.message?.content ?? '')
 }
 
+async function analyzeTile(
+  tile: Tile,
+  inlinedRefs: Array<{ product: string; dataUrl: string }>,
+  catalogLine: string
+): Promise<GlobalBottle[]> {
+  const content: any[] = [{ type: 'text', text: catalogLine }]
+  if (inlinedRefs.length) {
+    content.push({
+      type: 'text',
+      text: `REFERENCE GALLERY (${inlinedRefs.length} known products). Use these as ground-truth naming when a shelf bottle matches.`,
+    })
+    inlinedRefs.forEach((ref, i) => {
+      content.push({ type: 'text', text: `Reference #${i + 1}: ${ref.product}` })
+      content.push({ type: 'image_url', image_url: { url: ref.dataUrl, detail: 'low' } })
+    })
+  }
+  content.push({
+    type: 'text',
+    text: `SHELF CROP (tile ${tile.id}). Enumerate every bottle you see with a tight bbox:`,
+  })
+  content.push({
+    type: 'image_url',
+    image_url: { url: `data:${tile.mime};base64,${tile.base64}`, detail: 'high' },
+  })
+
+  let raw: any
+  try {
+    raw = await callOpenAI([
+      { role: 'system', content: SYSTEM_PROMPT },
+      { role: 'user', content },
+    ])
+  } catch {
+    return []
+  }
+
+  const bottlesRaw: any[] = Array.isArray(raw?.bottles) ? raw.bottles : []
+  const out: GlobalBottle[] = []
+  for (const b of bottlesRaw) {
+    if (!b || typeof b !== 'object') continue
+    const product = String(b.product ?? b.name ?? '').trim()
+    if (!product) continue
+    const bbox = Array.isArray(b.bbox) ? b.bbox : null
+    let lx = 0,
+      ly = 0,
+      lw = 1,
+      lh = 1
+    if (bbox && bbox.length === 4) {
+      lx = Math.max(0, Math.min(1, Number(bbox[0])))
+      ly = Math.max(0, Math.min(1, Number(bbox[1])))
+      lw = Math.max(0, Math.min(1 - lx, Number(bbox[2])))
+      lh = Math.max(0, Math.min(1 - ly, Number(bbox[3])))
+      if (!Number.isFinite(lx + ly + lw + lh) || lw < 0.01 || lh < 0.05) continue
+    }
+    // map tile-local normalized -> global normalized
+    const gx = tile.ox + lx * tile.ow
+    const gy = tile.oy + ly * tile.oh
+    const gw = lw * tile.ow
+    const gh = lh * tile.oh
+    out.push({
+      product,
+      fill_level: snapFill(b.fill_level ?? b.fill ?? 1),
+      confidence: typeof b.confidence === 'number' ? b.confidence : 0.7,
+      matched_reference: !!b.matched_reference,
+      barcode: b.barcode ? String(b.barcode) : null,
+      notes: b.notes ? String(b.notes) : null,
+      gx,
+      gy,
+      gw,
+      gh,
+      source_tile: tile.id,
+    })
+  }
+  return out
+}
+
+/** IoU between two global normalized bboxes. */
+function iou(a: GlobalBottle, b: GlobalBottle): number {
+  const ax2 = a.gx + a.gw
+  const ay2 = a.gy + a.gh
+  const bx2 = b.gx + b.gw
+  const by2 = b.gy + b.gh
+  const ix1 = Math.max(a.gx, b.gx)
+  const iy1 = Math.max(a.gy, b.gy)
+  const ix2 = Math.min(ax2, bx2)
+  const iy2 = Math.min(ay2, by2)
+  if (ix2 <= ix1 || iy2 <= iy1) return 0
+  const inter = (ix2 - ix1) * (iy2 - iy1)
+  const ua = a.gw * a.gh + b.gw * b.gh - inter
+  return ua > 0 ? inter / ua : 0
+}
+
+function productsMatch(a: string, b: string): boolean {
+  const na = a.toLowerCase().trim()
+  const nb = b.toLowerCase().trim()
+  if (na === nb) return true
+  // generous match: shared 4+ char token
+  const ta = new Set(na.split(/[^a-z0-9]+/).filter((s) => s.length >= 4))
+  for (const t of nb.split(/[^a-z0-9]+/)) {
+    if (t.length >= 4 && ta.has(t)) return true
+  }
+  return false
+}
+
+/** Dedup bottles whose global bbox overlaps significantly AND products plausibly match. */
+function dedupe(bottles: GlobalBottle[]): GlobalBottle[] {
+  const kept: GlobalBottle[] = []
+  for (const b of bottles) {
+    let merged = false
+    for (const k of kept) {
+      if (iou(b, k) > 0.35 && productsMatch(b.product, k.product)) {
+        // keep the higher-confidence / reference-matched one's product name
+        if (!k.matched_reference && b.matched_reference) {
+          k.product = b.product
+          k.matched_reference = true
+        } else if (b.confidence > k.confidence && b.product.length > k.product.length) {
+          k.product = b.product
+        }
+        k.confidence = Math.max(k.confidence, b.confidence)
+        if (!k.barcode && b.barcode) k.barcode = b.barcode
+        merged = true
+        break
+      }
+    }
+    if (!merged) kept.push(b)
+  }
+  return kept
+}
+
+/** Aggregate per-bottle list into (product × fill_level) detection rows. */
+function aggregate(bottles: GlobalBottle[]) {
+  const bucket = new Map<string, {
+    product: string
+    count: number
+    fill_level: number
+    confSum: number
+    confCount: number
+    barcode: string | null
+    matched_reference: boolean
+    sampleNote: string | null
+  }>()
+  for (const b of bottles) {
+    const key = `${b.product.toLowerCase()}|${b.fill_level}`
+    const existing = bucket.get(key)
+    if (!existing) {
+      bucket.set(key, {
+        product: b.product,
+        count: 1,
+        fill_level: b.fill_level,
+        confSum: b.confidence,
+        confCount: 1,
+        barcode: b.barcode,
+        matched_reference: b.matched_reference,
+        sampleNote: b.notes,
+      })
+    } else {
+      existing.count += 1
+      existing.confSum += b.confidence
+      existing.confCount += 1
+      if (!existing.barcode && b.barcode) existing.barcode = b.barcode
+      if (b.matched_reference) existing.matched_reference = true
+    }
+  }
+  return Array.from(bucket.values()).map((x) => ({
+    product: x.product,
+    count: x.count,
+    fill_level: x.fill_level,
+    confidence: Math.round((x.confSum / x.confCount) * 100) / 100,
+    barcode: x.barcode,
+    notes: x.sampleNote
+      ? x.matched_reference
+        ? `${x.sampleNote} · matched reference`
+        : x.sampleNote
+      : x.matched_reference
+        ? 'matched reference'
+        : null,
+  }))
+}
+
+function parseGrid(value: string | undefined): { cols: number; rows: number } {
+  const v = (value ?? DEFAULT_GRID ?? '2x2').toLowerCase()
+  const m = v.match(/^(\d)x(\d)$/)
+  if (!m) return { cols: 2, rows: 2 }
+  const cols = Math.max(1, Math.min(4, parseInt(m[1], 10)))
+  const rows = Math.max(1, Math.min(4, parseInt(m[2], 10)))
+  return { cols, rows }
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: CORS_HEADERS })
   if (req.method !== 'POST') return json({ error: 'method not allowed' }, 405)
@@ -311,6 +484,7 @@ Deno.serve(async (req) => {
     image_base64?: string
     catalog?: string[]
     references?: Array<{ product: string; image_url: string }>
+    tile_grid?: string
     skip_verify?: boolean
   }
   try {
@@ -326,7 +500,7 @@ Deno.serve(async (req) => {
   const catalog = Array.isArray(payload.catalog) ? payload.catalog.slice(0, 500) : []
   const catalogLine = catalog.length
     ? `Known catalog (prefer matching to these names when plausible): ${catalog.join(', ')}.`
-    : 'Analyze this shelf photo.'
+    : 'Analyze this shelf crop.'
 
   const rawRefs = Array.isArray(payload.references)
     ? payload.references
@@ -334,108 +508,43 @@ Deno.serve(async (req) => {
         .slice(0, 25)
     : []
 
+  const grid = parseGrid(payload.tile_grid)
+
+  // Decode + tile
+  let tiles: Tile[]
+  try {
+    const bytes = base64ToBytes(image)
+    tiles = await tileImage(bytes, grid)
+  } catch (e: any) {
+    return json({ error: 'decode_failed', detail: String(e).slice(0, 300) }, 400)
+  }
+  if (tiles.length === 0) return json({ error: 'no tiles produced' }, 500)
+
+  // Fetch references once, reuse across all tiles
   const inlinedRefs = rawRefs.length ? await fetchReferenceImages(rawRefs) : []
 
-  const shelfImagePart = {
-    type: 'image_url' as const,
-    image_url: { url: `data:image/jpeg;base64,${image}`, detail: 'high' as const },
-  }
+  // Analyze every tile in parallel
+  const perTile = await Promise.all(
+    tiles.map((t) => analyzeTile(t, inlinedRefs, catalogLine))
+  )
+  const allBottles: GlobalBottle[] = perTile.flat()
 
-  const userContent: any[] = [{ type: 'text', text: catalogLine }]
-  if (inlinedRefs.length) {
-    userContent.push({
-      type: 'text',
-      text: `REFERENCE GALLERY (${inlinedRefs.length} known products). Use these as ground-truth naming when a shelf bottle matches.`,
-    })
-    inlinedRefs.forEach((ref, i) => {
-      userContent.push({ type: 'text', text: `Reference #${i + 1}: ${ref.product}` })
-      userContent.push({
-        type: 'image_url',
-        image_url: { url: ref.dataUrl, detail: 'low' },
-      })
-    })
-  }
-  userContent.push({ type: 'text', text: 'SHELF PHOTO (target — enumerate every bottle):' })
-  userContent.push(shelfImagePart)
+  // Dedupe bottles that sit in overlap regions (appear in 2 adjacent tiles)
+  const beforeDedupe = allBottles.length
+  const deduped = dedupe(allBottles)
 
-  // --- Pass 1: enumerate every bottle ---
-  let primary: any
-  try {
-    primary = await callOpenAI([
-      { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: userContent },
-    ])
-  } catch (e: any) {
-    return json({ error: 'openai_failed', detail: String(e).slice(0, 500) }, 502)
-  }
+  const detections = aggregate(deduped)
 
-  let bottles: BottleEntry[] = Array.isArray(primary?.bottles)
-    ? (primary.bottles.map(normalizeBottle).filter(Boolean) as BottleEntry[])
-    : []
-  const warnings: string[] = Array.isArray(primary?.warnings)
-    ? primary.warnings.map(String)
-    : []
-
-  const meta: any = {
+  const meta = {
     model: MODEL,
+    grid: `${grid.cols}x${grid.rows}`,
+    tiles: tiles.length,
     reference_count: inlinedRefs.length,
-    pass1_bottles: bottles.length,
-    verified: false,
+    raw_bottles: beforeDedupe,
+    deduped_bottles: deduped.length,
+    per_tile: tiles.map((t, i) => ({ id: t.id, bottles: perTile[i].length })),
   }
 
-  // --- Pass 2: self-verification ---
-  const doVerify = SELF_VERIFY && !payload.skip_verify && bottles.length > 0
-  if (doVerify) {
-    try {
-      const priorSummary = JSON.stringify(
-        bottles.map((b, i) => ({
-          index: i,
-          product: b.product,
-          fill_level: b.fill_level,
-          shelf_row: b.shelf_row,
-          position: b.position,
-          depth: b.depth,
-        }))
-      )
-      const verifyUser: any[] = [
-        { type: 'text', text: `Prior answer (indexed): ${priorSummary}` },
-        { type: 'text', text: 'SHELF PHOTO (the same one):' },
-        shelfImagePart,
-      ]
-      const verify = await callOpenAI([
-        { role: 'system', content: VERIFY_PROMPT },
-        { role: 'user', content: verifyUser },
-      ])
-
-      const additions: BottleEntry[] = Array.isArray(verify?.additional_bottles)
-        ? (verify.additional_bottles.map(normalizeBottle).filter(Boolean) as BottleEntry[])
-        : []
-      const removeIdxRaw: any[] = Array.isArray(verify?.remove_indices)
-        ? verify.remove_indices
-        : []
-      const removeIdx = new Set<number>(
-        removeIdxRaw
-          .map((x) => (typeof x === 'number' ? x : parseInt(String(x), 10)))
-          .filter((n) => Number.isFinite(n))
-      )
-
-      const existingKeys = new Set(bottles.map(bottleKey))
-      const uniqueAdditions = additions.filter((a) => !existingKeys.has(bottleKey(a)))
-
-      const removed = removeIdx.size
-      bottles = bottles.filter((_, i) => !removeIdx.has(i)).concat(uniqueAdditions)
-
-      meta.verified = true
-      meta.added = uniqueAdditions.length
-      meta.removed = removed
-      meta.pass2_bottles = bottles.length
-    } catch (e: any) {
-      warnings.push(`verify_pass_skipped: ${String(e).slice(0, 200)}`)
-    }
-  }
-
-  const detections = aggregate(bottles)
-  meta.total_bottles = bottles.length
-
-  return json({ detections, warnings, meta })
+  // Keep response shape backward compatible (detections[] + warnings[])
+  return json({ detections, warnings: [], meta })
 })
