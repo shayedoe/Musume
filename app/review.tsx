@@ -1,58 +1,69 @@
-import { useState, useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { View, Text, TextInput, Pressable, Alert, ScrollView, Image, ActivityIndicator } from 'react-native'
 import { useRouter, useLocalSearchParams } from 'expo-router'
 import * as Sharing from 'expo-sharing'
 import { File, Paths } from 'expo-file-system'
 import { supabase } from '../lib/supabase'
+import type { FillLevel } from '../lib/types'
 
-interface CountItem {
+interface ReviewRow {
   id: string
+  detectionId?: string
   product: string
-  quantity: string
-  section: string
+  count: string   // number of bottles at this fill level
+  fill: FillLevel
+  confidence?: number | null
+  notes?: string | null
+  isManual?: boolean
 }
+
+const FILL_OPTIONS: { label: string; value: FillLevel }[] = [
+  { label: 'Full (1)', value: 1 },
+  { label: 'Half (0.5)', value: 0.5 },
+  { label: 'Low (0.1)', value: 0.1 },
+  { label: 'Empty (0)', value: 0 },
+]
 
 export default function Review() {
   const router = useRouter()
-  const { session_id } = useLocalSearchParams()
+  const { session_id } = useLocalSearchParams<{ session_id: string }>()
   const [loading, setLoading] = useState(true)
   const [exporting, setExporting] = useState(false)
-  const [imageUrl, setImageUrl] = useState<string | null>(null)
-  const [counts, setCounts] = useState<CountItem[]>([
-    { id: '1', product: '', quantity: '', section: 'Shelf A' }
-  ])
+  const [imageUrls, setImageUrls] = useState<string[]>([])
+  const [rows, setRows] = useState<ReviewRow[]>([])
 
   useEffect(() => {
     loadSessionData()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   const loadSessionData = async () => {
     try {
-      // Load photo for this session
-      const { data: photoData, error: photoError } = (await supabase
+      const { data: photoData } = await (supabase as any)
         .from('photos')
         .select('image_url')
         .eq('session_id', session_id)
-        .single()) as any
+      setImageUrls(((photoData as any[]) ?? []).map((p) => p.image_url))
 
-      if (photoError) throw photoError
-      setImageUrl((photoData as any).image_url)
-
-      // Load existing counts if any
-      const { data: countsData, error: countsError } = (await (supabase as any)
-        .from('final_counts')
+      const { data: detData } = await (supabase as any)
+        .from('detections')
         .select('*')
-        .eq('session_id', session_id)) as any
+        .eq('session_id', session_id)
 
-      if (countsError && countsError.code !== 'PGRST116') throw countsError
+      const detectionRows: ReviewRow[] = ((detData as any[]) ?? []).map((d: any, i: number) => ({
+        id: `d-${d.id ?? i}`,
+        detectionId: d.id,
+        product: d.predicted_product ?? '',
+        count: String(d.count ?? 1),
+        fill: snapFill(d.fill_level),
+        confidence: d.confidence,
+        notes: d.notes,
+      }))
 
-      if (countsData && countsData.length > 0) {
-        setCounts((countsData as any).map((c: any, idx: number) => ({
-          id: String(idx + 1),
-          product: c.product || '',
-          quantity: String(c.quantity || ''),
-          section: c.section || 'Shelf A'
-        })))
+      if (detectionRows.length === 0) {
+        setRows([{ id: 'm-1', product: '', count: '1', fill: 1, isManual: true }])
+      } else {
+        setRows(detectionRows)
       }
     } catch (error: any) {
       Alert.alert('Error', error.message || 'Failed to load session data')
@@ -61,65 +72,57 @@ export default function Review() {
     }
   }
 
-  const addNewRow = () => {
-    setCounts([...counts, {
-      id: String(counts.length + 1),
-      product: '',
-      quantity: '',
-      section: 'Shelf A'
-    }])
+  const updateRow = (id: string, patch: Partial<ReviewRow>) => {
+    setRows((prev) => prev.map((r) => (r.id === id ? { ...r, ...patch } : r)))
   }
 
-  const updateCount = (id: string, field: keyof CountItem, value: string) => {
-    setCounts(counts.map((c: CountItem) => c.id === id ? { ...c, [field]: value } : c))
+  const removeRow = (id: string) => {
+    setRows((prev) => (prev.length > 1 ? prev.filter((r) => r.id !== id) : prev))
   }
 
-  const removeCount = (id: string) => {
-    if (counts.length > 1) {
-      setCounts(counts.filter((c: CountItem) => c.id !== id))
+  const addManualRow = () => {
+    setRows((prev) => [
+      ...prev,
+      { id: `m-${Date.now()}`, product: '', count: '1', fill: 1, isManual: true },
+    ])
+  }
+
+  /**
+   * Each row = N bottles at one fill level. Final qty = count × fill,
+   * aggregated per product.
+   */
+  const buildFinalCounts = () => {
+    const bucket = new Map<string, { product: string; quantity: number }>()
+    for (const r of rows) {
+      const name = r.product.trim()
+      if (!name) continue
+      const c = parseFloat(r.count)
+      if (!Number.isFinite(c) || c <= 0) continue
+      const qty = c * r.fill
+      const key = name.toLowerCase()
+      const existing = bucket.get(key)
+      if (existing) existing.quantity += qty
+      else bucket.set(key, { product: name, quantity: qty })
     }
+    return Array.from(bucket.values()).map((b) => ({
+      ...b,
+      quantity: Math.round(b.quantity * 100) / 100,
+    }))
   }
 
   const saveCounts = async () => {
     try {
-      // Delete existing counts
-      const { error: deleteError } = await supabase
-        .from('final_counts')
-        .delete()
-        .eq('session_id', session_id)
-
-      if (deleteError) throw deleteError
-      // Insert new counts
-      const validCounts = counts.filter((c: CountItem) => c.product.trim() && c.quantity.trim())
-
-      if (validCounts.length === 0) {
-        Alert.alert('No data', 'Please add at least one product with quantity')
+      const finals = buildFinalCounts()
+      if (finals.length === 0) {
+        Alert.alert('No data', 'Add at least one product with a count.')
         return
       }
-
-      const parsedCounts = validCounts.map((c: CountItem) => ({
-        ...c,
-        parsedQuantity: parseFloat(c.quantity)
-      }))
-
-      const invalidCount = parsedCounts.find((c) => !Number.isFinite(c.parsedQuantity))
-
-      if (invalidCount) {
-        Alert.alert('Invalid quantity', `Please enter a valid number for ${invalidCount.product || 'the product'} before saving`)
-        return
-      }
-
-      const { error } = await ((supabase as any)
+      await (supabase as any).from('final_counts').delete().eq('session_id', session_id)
+      const { error } = await (supabase as any)
         .from('final_counts')
-        .insert(parsedCounts.map((c) => ({
-          session_id,
-          product: c.product,
-          quantity: c.parsedQuantity,
-          section: c.section
-        })) as any) as any)
-
+        .insert(finals.map((f) => ({ session_id, ...f })) as any)
       if (error) throw error
-      Alert.alert('Success', 'Counts saved successfully')
+      Alert.alert('Saved', `Saved ${finals.length} product line${finals.length > 1 ? 's' : ''}.`)
     } catch (error: any) {
       Alert.alert('Error', error.message || 'Failed to save counts')
     }
@@ -128,34 +131,23 @@ export default function Review() {
   const exportToCSV = async () => {
     setExporting(true)
     try {
-      const validCounts = counts.filter((c: CountItem) => c.product.trim() && c.quantity.trim())
-
-      if (validCounts.length === 0) {
-        Alert.alert('No data', 'Please add at least one product with quantity')
+      const finals = buildFinalCounts()
+      if (finals.length === 0) {
+        Alert.alert('No data', 'Add at least one product with a count.')
         return
       }
-
-      // Generate CSV content
-      const csvHeader = 'Product,Count,Unit,Section\n'
-      const csvRows = validCounts.map((c: CountItem) =>
-        `${c.product},${c.quantity},bottle,${c.section}`
-      ).join('\n')
-      const csvContent = csvHeader + csvRows
-
-      // Save to file using new expo-file-system API
+      const header = 'Product,Count,Unit\n'
+      const body = finals
+        .map((f) => `"${f.product.replace(/"/g, '""')}",${f.quantity},bottle`)
+        .join('\n')
+      const csv = header + body
       const fileName = `inventory_${session_id}_${Date.now()}.csv`
       const file = new File(Paths.document, fileName)
-      file.write(csvContent)
-
-      // Share file
-      const canShare = await Sharing.isAvailableAsync()
-      if (canShare) {
-        await Sharing.shareAsync(file.uri, {
-          mimeType: 'text/csv',
-          dialogTitle: 'Export Inventory CSV'
-        })
+      file.write(csv)
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(file.uri, { mimeType: 'text/csv', dialogTitle: 'Export Inventory CSV' })
       } else {
-        Alert.alert('Success', `CSV saved to ${file.uri}`)
+        Alert.alert('Saved', `CSV saved to ${file.uri}`)
       }
     } catch (error: any) {
       Alert.alert('Error', error.message || 'Failed to export CSV')
@@ -172,147 +164,173 @@ export default function Review() {
     )
   }
 
+  const finals = buildFinalCounts()
+
   return (
     <ScrollView style={{ flex: 1, backgroundColor: '#fff' }}>
       <View style={{ padding: 20 }}>
-        <Text style={{ fontSize: 24, fontWeight: 'bold', marginBottom: 20 }}>
-          Review & Count
-        </Text>
+        <Text style={{ fontSize: 24, fontWeight: '700', marginBottom: 12 }}>Review & Count</Text>
 
-        {imageUrl && (
-          <Image
-            source={{ uri: imageUrl }}
-            style={{ width: '100%', height: 200, marginBottom: 20, borderRadius: 10 }}
-            resizeMode="contain"
-          />
+        {imageUrls.length > 0 && (
+          <ScrollView horizontal style={{ marginBottom: 16 }}>
+            <View style={{ flexDirection: 'row', gap: 8 }}>
+              {imageUrls.map((url) => (
+                <Image
+                  key={url}
+                  source={{ uri: url }}
+                  style={{ width: 140, height: 180, borderRadius: 8 }}
+                  resizeMode="cover"
+                />
+              ))}
+            </View>
+          </ScrollView>
         )}
 
-        <Text style={{ fontSize: 18, fontWeight: '600', marginBottom: 15 }}>
-          Manual Counts
+        <Text style={{ fontSize: 16, fontWeight: '600', marginBottom: 8 }}>
+          AI Detections ({rows.filter((r) => !r.isManual).length}) + Manual ({rows.filter((r) => r.isManual).length})
+        </Text>
+        <Text style={{ fontSize: 12, color: '#666', marginBottom: 12 }}>
+          Each row = N bottles at one fill level. Final qty = count × fill.
         </Text>
 
-        {counts.map((count: CountItem, index: number) => (
+        {rows.map((r) => (
           <View
-            key={count.id}
+            key={r.id}
             style={{
-              padding: 15,
-              backgroundColor: '#f5f5f5',
+              padding: 12,
+              backgroundColor: r.isManual ? '#fff8e1' : '#f5f5f5',
               borderRadius: 8,
-              marginBottom: 10
+              marginBottom: 10,
+              borderWidth: 1,
+              borderColor: r.isManual ? '#ffe0a3' : '#eee',
             }}
           >
             <TextInput
               placeholder="Product name"
-              value={count.product}
-              onChangeText={(text: string) => updateCount(count.id, 'product', text)}
+              value={r.product}
+              onChangeText={(text) => updateRow(r.id, { product: text })}
               style={{
-                padding: 10,
-                backgroundColor: '#fff',
-                borderRadius: 5,
-                marginBottom: 8,
-                fontSize: 16
+                padding: 10, backgroundColor: '#fff', borderRadius: 6,
+                marginBottom: 8, fontSize: 15,
               }}
             />
-            <View style={{ flexDirection: 'row', gap: 10, marginBottom: 8 }}>
+            <View style={{ flexDirection: 'row', gap: 8, marginBottom: 8, alignItems: 'center' }}>
+              <Text style={{ fontSize: 13, color: '#666' }}>Bottles:</Text>
               <TextInput
-                placeholder="Quantity"
-                value={count.quantity}
-                onChangeText={(text: string) => updateCount(count.id, 'quantity', text)}
-                keyboardType="decimal-pad"
+                placeholder="#"
+                value={r.count}
+                onChangeText={(text) => updateRow(r.id, { count: text })}
+                keyboardType="number-pad"
                 style={{
-                  flex: 1,
-                  padding: 10,
-                  backgroundColor: '#fff',
-                  borderRadius: 5,
-                  fontSize: 16
-                }}
-              />
-              <TextInput
-                placeholder="Section"
-                value={count.section}
-                onChangeText={(text: string) => updateCount(count.id, 'section', text)}
-                style={{
-                  flex: 1,
-                  padding: 10,
-                  backgroundColor: '#fff',
-                  borderRadius: 5,
-                  fontSize: 16
+                  width: 70, padding: 10, backgroundColor: '#fff',
+                  borderRadius: 6, fontSize: 15, textAlign: 'center',
                 }}
               />
             </View>
-            {counts.length > 1 && (
-              <Pressable
-                onPress={() => removeCount(count.id)}
-                style={{ alignSelf: 'flex-end' }}
-              >
-                <Text style={{ color: '#ff3b30', fontSize: 14 }}>Remove</Text>
-              </Pressable>
-            )}
+
+            <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginBottom: 4 }}>
+              {FILL_OPTIONS.map((opt) => {
+                const selected = r.fill === opt.value
+                return (
+                  <Pressable
+                    key={opt.value}
+                    onPress={() => updateRow(r.id, { fill: opt.value })}
+                    style={{
+                      paddingVertical: 6, paddingHorizontal: 10,
+                      borderRadius: 16,
+                      backgroundColor: selected ? '#007AFF' : '#e7e7ea',
+                    }}
+                  >
+                    <Text style={{ color: selected ? '#fff' : '#333', fontSize: 13 }}>{opt.label}</Text>
+                  </Pressable>
+                )
+              })}
+            </View>
+
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+              <Text style={{ fontSize: 12, color: '#666' }}>
+                {r.confidence != null ? `AI conf: ${(r.confidence * 100).toFixed(0)}%` : r.isManual ? 'Manual' : 'AI'}
+                {'  •  '}
+                qty = {((parseFloat(r.count) || 0) * r.fill).toFixed(2)}
+              </Text>
+              {rows.length > 1 && (
+                <Pressable onPress={() => removeRow(r.id)}>
+                  <Text style={{ color: '#ff3b30', fontSize: 13 }}>Remove</Text>
+                </Pressable>
+              )}
+            </View>
           </View>
         ))}
 
         <Pressable
-          onPress={addNewRow}
+          onPress={addManualRow}
           style={{
-            padding: 15,
-            backgroundColor: '#e0e0e0',
-            borderRadius: 8,
-            alignItems: 'center',
-            marginBottom: 20
+            padding: 14, backgroundColor: '#e0e0e0', borderRadius: 8,
+            alignItems: 'center', marginBottom: 20,
           }}
         >
-          <Text style={{ fontSize: 16, color: '#333' }}>+ Add Another Item</Text>
+          <Text style={{ fontSize: 15, color: '#333' }}>+ Add Missed Bottle</Text>
         </Pressable>
+
+        <View style={{ padding: 12, backgroundColor: '#f0f7ff', borderRadius: 8, marginBottom: 20 }}>
+          <Text style={{ fontSize: 14, fontWeight: '600', marginBottom: 6 }}>
+            Export Preview ({finals.length} product{finals.length === 1 ? '' : 's'})
+          </Text>
+          {finals.slice(0, 8).map((f, i) => (
+            <Text key={i} style={{ fontSize: 12, color: '#333' }}>
+              {f.product} — {f.quantity} bottle{f.quantity === 1 ? '' : 's'}
+            </Text>
+          ))}
+          {finals.length > 8 && (
+            <Text style={{ fontSize: 12, color: '#666' }}>…and {finals.length - 8} more</Text>
+          )}
+        </View>
 
         <View style={{ gap: 10 }}>
           <Pressable
             onPress={saveCounts}
-            style={{
-              padding: 15,
-              backgroundColor: '#34C759',
-              borderRadius: 8,
-              alignItems: 'center'
-            }}
+            style={{ padding: 15, backgroundColor: '#34C759', borderRadius: 8, alignItems: 'center' }}
           >
-            <Text style={{ color: '#fff', fontSize: 18, fontWeight: '600' }}>
-              Save Counts
-            </Text>
+            <Text style={{ color: '#fff', fontSize: 17, fontWeight: '600' }}>Save Counts</Text>
           </Pressable>
-
           <Pressable
             onPress={exportToCSV}
             disabled={exporting}
             style={{
-              padding: 15,
-              backgroundColor: exporting ? '#ccc' : '#007AFF',
-              borderRadius: 8,
-              alignItems: 'center'
+              padding: 15, backgroundColor: exporting ? '#ccc' : '#007AFF',
+              borderRadius: 8, alignItems: 'center',
             }}
           >
             {exporting ? (
               <ActivityIndicator color="#fff" />
             ) : (
-              <Text style={{ color: '#fff', fontSize: 18, fontWeight: '600' }}>
-                Export CSV
-              </Text>
+              <Text style={{ color: '#fff', fontSize: 17, fontWeight: '600' }}>Export CSV</Text>
             )}
           </Pressable>
-
           <Pressable
             onPress={() => router.push('/')}
-            style={{
-              padding: 15,
-              backgroundColor: '#666',
-              borderRadius: 8,
-              alignItems: 'center'
-            }}
+            style={{ padding: 15, backgroundColor: '#666', borderRadius: 8, alignItems: 'center' }}
           >
-            <Text style={{ color: '#fff', fontSize: 18 }}>
-              Back to Home
-            </Text>
+            <Text style={{ color: '#fff', fontSize: 16 }}>Back to Home</Text>
           </Pressable>
         </View>
       </View>
     </ScrollView>
   )
+}
+
+function snapFill(v: any): FillLevel {
+  const n = typeof v === 'number' ? v : parseFloat(String(v))
+  const buckets: FillLevel[] = [1, 0.5, 0.1, 0]
+  if (!Number.isFinite(n)) return 1
+  let best: FillLevel = 1
+  let bd = Infinity
+  for (const b of buckets) {
+    const d = Math.abs(n - b)
+    if (d < bd) {
+      bd = d
+      best = b
+    }
+  }
+  return best
 }

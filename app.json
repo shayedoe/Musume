@@ -10,6 +10,14 @@
       "expo-router",
       "expo-image-picker"
     ],
+    "runtimeVersion": {
+      "policy": "appVersion"
+    },
+    "updates": {
+      "url": "https://u.expo.dev/3001b491-fdf2-43ce-a93c-c396fcb71b1e",
+      "checkAutomatically": "ON_LOAD",
+      "fallbackToCacheTimeout": 0
+    },
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.shayedoe.musume",
@@ -23,6 +31,8 @@
     "extra": {
       "supabaseUrl": "https://txgcqrymhuiivecpcsnh.supabase.co",
       "supabaseAnonKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+      "visionEndpoint": "",
+      "openaiApiKey": "REDACTED",
       "router": {
         "origin": false
       },

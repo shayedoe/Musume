@@ -37,6 +37,8 @@ npm install
 This will create:
 - `inventory_sessions` table
 - `photos` table
+- `products` table (bottle catalog)
+- `detections` table (AI-proposed bottle detections)
 - `final_counts` table
 - Appropriate indexes and Row Level Security policies
 
@@ -65,6 +67,8 @@ Edit `app.json` and replace the Supabase credentials:
     "extra": {
       "supabaseUrl": "YOUR_SUPABASE_URL_HERE",
       "supabaseAnonKey": "YOUR_SUPABASE_ANON_KEY_HERE",
+      "visionEndpoint": "",
+      "openaiApiKey": "",
       "eas": {
         "projectId": "REPLACE_WITH_EAS_PROJECT_ID"
       }
@@ -72,6 +76,32 @@ Edit `app.json` and replace the Supabase credentials:
   }
 }
 ```
+
+### 2.6 Configure the Vision Backend
+
+The app sends each shelf photo to a vision model to detect bottles, count
+duplicates, and estimate fill level. Pick ONE option:
+
+**Option A – Your own vision endpoint (recommended for production).**
+Set `extra.visionEndpoint` to a URL that accepts:
+
+```json
+POST { "image_base64": "...", "catalog": ["Tito's Vodka 750ml", ...] }
+```
+
+and returns:
+
+```json
+{ "detections": [ { "product": "...", "count": 1, "fill_level": 1, "confidence": 0.8, "barcode": null, "notes": "" } ], "warnings": [] }
+```
+
+Fill level must be one of `1` (full/unopened), `0.5` (about half),
+`0.1` (nearly empty), or `0` (empty).
+
+**Option B – OpenAI Vision (fastest to try).**
+Set `extra.openaiApiKey` to an OpenAI API key. The app will call
+`gpt-4o-mini` with the image directly. Note: embedding a key in a client
+app is **not** safe for production; use Option A with a server proxy.
 
 ## Step 3: Test Locally
 
@@ -92,14 +122,22 @@ Then scan the QR code with your iPhone camera or Expo Go app.
 ## Step 4: Test the Flow
 
 1. Open the app
-2. Tap **Start Session**
-3. Take a photo with the camera
-4. Review the image and add manual counts:
-   - Product name (e.g., "Don Julio Blanco")
-   - Quantity (e.g., "2.5")
-   - Section (e.g., "Shelf A")
-5. Tap **Save Counts** to save to database
-6. Tap **Export CSV** to download the CSV file
+2. Tap **Start Session – Take Photo** or **Start Session – Upload Photo**
+3. Add one or more shelf photos (camera or gallery). You can upload a saved
+   inventory photo to troubleshoot bottle detection.
+4. Tap **Analyze N photos**. The app will:
+   - Create a session
+   - Send each image to your configured vision backend
+   - Detect bottles, count duplicates, and estimate fill level (1 / 0.5 / 0.1)
+   - Match detections to the product catalog
+   - Save photos + detections to Supabase
+5. On the **Review** screen you can:
+   - Edit the AI-proposed product names
+   - Fix the bottle count at each fill level
+   - Change the fill bucket (Full / Half / Low / Empty)
+   - Add missed bottles manually
+6. Tap **Save Counts** to write `final_counts` (quantity = count × fill).
+7. Tap **Export CSV** to export a MarginEdge-friendly CSV.
 
 ## Step 5: Verify Data in Supabase
 
