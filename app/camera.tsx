@@ -2,7 +2,6 @@ import { useState } from 'react'
 import { View, Text, Pressable, Alert, ActivityIndicator, Image } from 'react-native'
 import { useRouter } from 'expo-router'
 import * as ImagePicker from 'expo-image-picker'
-import * as FileSystem from 'expo-file-system'
 import { supabase } from '../lib/supabase'
 
 export default function Camera() {

@@ -1,5 +1,9 @@
 {
   "build": {
-    "production": {}
+    "production": {
+      "ios": {
+        "image": "latest"
+      }
+    }
   }
 }

@@ -2,7 +2,7 @@ import { useState, useEffect } from 'react'
 import { View, Text, TextInput, Pressable, Alert, ScrollView, Image, ActivityIndicator } from 'react-native'
 import { useRouter, useLocalSearchParams } from 'expo-router'
 import * as Sharing from 'expo-sharing'
-import * as FileSystem from 'expo-file-system'
+import { File, Paths } from 'expo-file-system'
 import { supabase } from '../lib/supabase'
 
 interface CountItem {
@@ -142,23 +142,20 @@ export default function Review() {
       ).join('\n')
       const csvContent = csvHeader + csvRows
 
-      // Save to file
+      // Save to file using new expo-file-system API
       const fileName = `inventory_${session_id}_${Date.now()}.csv`
-      const filePath = `${FileSystem.documentDirectory}${fileName}`
-
-      await FileSystem.writeAsStringAsync(filePath, csvContent, {
-        encoding: FileSystem.EncodingType.UTF8
-      })
+      const file = new File(Paths.document, fileName)
+      file.write(csvContent)
 
       // Share file
       const canShare = await Sharing.isAvailableAsync()
       if (canShare) {
-        await Sharing.shareAsync(filePath, {
+        await Sharing.shareAsync(file.uri, {
           mimeType: 'text/csv',
           dialogTitle: 'Export Inventory CSV'
         })
       } else {
-        Alert.alert('Success', `CSV saved to ${filePath}`)
+        Alert.alert('Success', `CSV saved to ${file.uri}`)
       }
     } catch (error: any) {
       Alert.alert('Error', error.message || 'Failed to export CSV')
