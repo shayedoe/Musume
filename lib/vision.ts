@@ -84,12 +84,23 @@ async function callVisionEndpoint(
   imageBase64: string,
   catalogHint: string[]
 ): Promise<any> {
+  const extra: any = Constants.expoConfig?.extra ?? {}
+  const anonKey: string | undefined = extra.supabaseAnonKey
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  // Supabase Edge Functions require both headers when verify_jwt is on
+  if (anonKey) {
+    headers['Authorization'] = `Bearer ${anonKey}`
+    headers['apikey'] = anonKey
+  }
   const res = await fetch(endpoint, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify({ image_base64: imageBase64, catalog: catalogHint }),
   })
-  if (!res.ok) throw new Error(`Vision endpoint failed: ${res.status}`)
+  if (!res.ok) {
+    const body = await res.text().catch(() => '')
+    throw new Error(`Vision endpoint failed: ${res.status} ${body.slice(0, 200)}`)
+  }
   return res.json()
 }
 
