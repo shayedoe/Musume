@@ -106,7 +106,22 @@ export default function Camera() {
     setBusy(true)
     try {
       // Reuse session from Home, or fall back to creating one.
-      let sessionId = session_id
+      // session_id may come back as string | string[] from useLocalSearchParams.
+      const incoming = Array.isArray(session_id) ? session_id[0] : session_id
+      let sessionId: string | undefined = incoming && incoming.length > 0 ? incoming : undefined
+
+      // Verify the passed session actually still exists. If it was deleted
+      // (or never created cleanly) we'd hit a FK violation on the photos
+      // insert below. Create a fresh one instead.
+      if (sessionId) {
+        const { data: existing } = await (supabase as any)
+          .from('inventory_sessions')
+          .select('id')
+          .eq('id', sessionId)
+          .maybeSingle()
+        if (!existing) sessionId = undefined
+      }
+
       if (!sessionId) {
         setStatus('Creating session...')
         const { data: sessionData, error: sessionError } = await (supabase as any)

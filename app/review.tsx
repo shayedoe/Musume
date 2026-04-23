@@ -650,13 +650,14 @@ function AnnotatedPhoto({
   annotations: BottleAnnotation[]
 }) {
   const [dims, setDims] = useState<{ w: number; h: number } | null>(null)
-  const W = 240
-  const H = 320
+  const W = 300
+  const H = 400
 
-  // Compute the visible rect of the image (cover resize crops out the rest).
+  // Compute the visible rect of the image. We use `contain` so the full
+  // photo is always visible (no cropping), then letterbox the remainder.
   let scaleX = W, scaleY = H, offsetX = 0, offsetY = 0
   if (dims) {
-    const scale = Math.max(W / dims.w, H / dims.h)
+    const scale = Math.min(W / dims.w, H / dims.h)
     const displayW = dims.w * scale
     const displayH = dims.h * scale
     offsetX = (W - displayW) / 2
@@ -671,7 +672,7 @@ function AnnotatedPhoto({
         width: W,
         height: H,
         borderRadius: 10,
-        backgroundColor: theme.surface,
+        backgroundColor: '#000',
         overflow: 'hidden',
         position: 'relative',
       }}
@@ -679,7 +680,7 @@ function AnnotatedPhoto({
       <Image
         source={{ uri: url }}
         style={{ width: W, height: H }}
-        resizeMode="cover"
+        resizeMode="contain"
         onLoad={(e) => {
           const src: any = e.nativeEvent?.source
           if (src && typeof src.width === 'number' && typeof src.height === 'number') {
@@ -694,21 +695,49 @@ function AnnotatedPhoto({
         const width = bw * scaleX
         const height = bh * scaleY
         const color = STATUS_COLORS[a.status] ?? STATUS_COLORS.unknown
+        // Filled translucent bottle-shaped mask: a rounded neck on top
+        // plus a body with the status color. We approximate the bottle
+        // silhouette by stacking two rounded rects (neck ~25% of height,
+        // ~35% of width centered; body fills the rest).
+        const neckH = Math.max(6, height * 0.22)
+        const neckW = Math.max(4, width * 0.38)
+        const neckX = left + (width - neckW) / 2
+        const bodyTop = top + neckH * 0.75
+        const bodyH = height - neckH * 0.75
         return (
-          <View
-            key={i}
-            pointerEvents="none"
-            style={{
-              position: 'absolute',
-              left,
-              top,
-              width,
-              height,
-              borderColor: color,
-              borderWidth: 1.5,
-              borderRadius: 2,
-            }}
-          />
+          <View key={i} pointerEvents="none">
+            {/* Neck */}
+            <View
+              style={{
+                position: 'absolute',
+                left: neckX,
+                top,
+                width: neckW,
+                height: neckH,
+                backgroundColor: color,
+                opacity: 0.45,
+                borderTopLeftRadius: 3,
+                borderTopRightRadius: 3,
+                borderWidth: 1,
+                borderColor: color,
+              }}
+            />
+            {/* Body */}
+            <View
+              style={{
+                position: 'absolute',
+                left,
+                top: bodyTop,
+                width,
+                height: bodyH,
+                backgroundColor: color,
+                opacity: 0.35,
+                borderRadius: Math.min(width, bodyH) * 0.18,
+                borderWidth: 1.5,
+                borderColor: color,
+              }}
+            />
+          </View>
         )
       })}
       {annotations.length > 0 && (
