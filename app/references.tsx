@@ -9,6 +9,7 @@ import {
   ScrollView,
   TextInput,
   FlatList,
+  StatusBar,
 } from 'react-native'
 import Constants from 'expo-constants'
 import { useRouter } from 'expo-router'
@@ -16,6 +17,7 @@ import * as ImagePicker from 'expo-image-picker'
 import * as ImageManipulator from 'expo-image-manipulator'
 import { supabase } from '../lib/supabase'
 import { ensureCatalogSeeded } from '../lib/catalog'
+import { theme } from '../lib/theme'
 import type { Product } from '../lib/types'
 
 interface BottleReferenceRow {
@@ -26,8 +28,6 @@ interface BottleReferenceRow {
   notes: string | null
 }
 
-// Re-encode to JPEG (HEIC safety) and downscale — references don't need
-// full resolution.
 async function toJpegSmall(uri: string): Promise<{ base64: string }> {
   const result = await ImageManipulator.manipulateAsync(uri, [{ resize: { width: 640 } }], {
     compress: 0.75,
@@ -46,6 +46,7 @@ export default function References() {
   const [uploadingFor, setUploadingFor] = useState<string | null>(null)
   const [autoSeeding, setAutoSeeding] = useState(false)
   const [autoSeedStatus, setAutoSeedStatus] = useState<string>('')
+  const [filterMode, setFilterMode] = useState<'all' | 'missing' | 'has'>('all')
 
   const load = async () => {
     try {
@@ -83,24 +84,24 @@ export default function References() {
   const filteredCatalog = useMemo(() => {
     const q = search.trim().toLowerCase()
     const bottles = catalog.filter((p) => /bottle/i.test(p.count_unit ?? ''))
-    if (!q) return bottles.slice(0, 150)
-    return bottles.filter((p) => p.name.toLowerCase().includes(q)).slice(0, 150)
-  }, [catalog, search])
+    let items = bottles
+    if (filterMode === 'missing') {
+      items = items.filter((p) => !refsByProduct.has(p.name))
+    } else if (filterMode === 'has') {
+      items = items.filter((p) => refsByProduct.has(p.name))
+    }
+    if (q) items = items.filter((p) => p.name.toLowerCase().includes(q))
+    return items.slice(0, 200)
+  }, [catalog, search, filterMode, refsByProduct])
 
   const addReferenceFor = async (productName: string, source: 'camera' | 'library') => {
     try {
       if (source === 'camera') {
         const { status } = await ImagePicker.requestCameraPermissionsAsync()
-        if (status !== 'granted') {
-          Alert.alert('Permission needed', 'Camera permission is required.')
-          return
-        }
+        if (status !== 'granted') return Alert.alert('Permission needed', 'Camera permission is required.')
       } else {
         const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync()
-        if (status !== 'granted') {
-          Alert.alert('Permission needed', 'Photo library permission is required.')
-          return
-        }
+        if (status !== 'granted') return Alert.alert('Permission needed', 'Photo library permission is required.')
       }
       const result =
         source === 'camera'
@@ -128,9 +129,7 @@ export default function References() {
         .upload(fileName, blob, { contentType: 'image/jpeg', upsert: false })
       if (upErr) throw upErr
 
-      const { data: urlData } = supabase.storage
-        .from('bottle-references')
-        .getPublicUrl(fileName)
+      const { data: urlData } = supabase.storage.from('bottle-references').getPublicUrl(fileName)
       const image_url = (urlData as any).publicUrl
 
       const { error: insErr } = await (supabase as any)
@@ -163,7 +162,7 @@ export default function References() {
       }
 
       setAutoSeeding(true)
-      setAutoSeedStatus(`Searching for ${targets.length} bottles... (can take 1–3 min)`)
+      setAutoSeedStatus(`Searching for ${targets.length} bottles… (1–3 min)`)
 
       const headers: Record<string, string> = { 'Content-Type': 'application/json' }
       if (anonKey) {
@@ -203,7 +202,6 @@ export default function References() {
               .delete()
               .eq('id', r.id)
             if (error) throw error
-            // best-effort remove storage file
             try {
               const path = r.image_url.split('/bottle-references/')[1]
               if (path) await supabase.storage.from('bottle-references').remove([path])
@@ -217,89 +215,146 @@ export default function References() {
     ])
   }
 
-  return (
-    <View style={{ flex: 1, backgroundColor: '#fff', paddingTop: 48 }}>
-      <View style={{ paddingHorizontal: 16, paddingBottom: 8, flexDirection: 'row', alignItems: 'center' }}>
-        <Pressable onPress={() => router.back()} style={{ padding: 8, marginRight: 8 }}>
-          <Text style={{ fontSize: 16, color: '#007AFF' }}>‹ Back</Text>
-        </Pressable>
-        <Text style={{ fontSize: 22, fontWeight: '700' }}>Bottle Reference Gallery</Text>
-      </View>
-      <Text style={{ paddingHorizontal: 16, color: '#666', marginBottom: 8, fontSize: 12 }}>
-        Add a photo of each bottle you stock. The AI uses these images to match + count bottles
-        in shelf photos more accurately. First 25 (lowest priority number) are sent per analysis.
-      </Text>
+  const totalBottles = useMemo(
+    () => catalog.filter((p) => /bottle/i.test(p.count_unit ?? '')).length,
+    [catalog]
+  )
+  const withRefs = refsByProduct.size
 
-      <View style={{ paddingHorizontal: 16, marginBottom: 8 }}>
+  return (
+    <View style={{ flex: 1, backgroundColor: theme.bg }}>
+      <StatusBar barStyle="light-content" backgroundColor={theme.bg} />
+
+      <View style={{ paddingTop: 56, paddingHorizontal: 20, paddingBottom: 8 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 14 }}>
+          <Pressable onPress={() => router.back()} hitSlop={10} style={{ marginRight: 12 }}>
+            <Text style={{ color: theme.textMuted, fontSize: 15 }}>‹  Back</Text>
+          </Pressable>
+        </View>
+        <Text style={{ color: theme.text, fontSize: 26, fontWeight: '700', letterSpacing: 0.2 }}>
+          References
+        </Text>
+        <Text style={{ color: theme.textMuted, fontSize: 13, marginTop: 4 }}>
+          {withRefs} of {totalBottles} bottles have a reference image.
+        </Text>
+      </View>
+
+      <View style={{ paddingHorizontal: 20, marginTop: 14 }}>
         <Pressable
           disabled={autoSeeding}
           onPress={() => autoSeedBatch(50)}
-          style={{
-            padding: 12,
-            backgroundColor: autoSeeding ? '#aaa' : '#AF52DE',
-            borderRadius: 8,
+          style={({ pressed }) => ({
+            padding: 14,
+            backgroundColor: autoSeeding
+              ? theme.surfaceAlt
+              : pressed
+                ? '#e7e7e9'
+                : theme.accent,
+            borderRadius: 12,
             alignItems: 'center',
-          }}
+          })}
         >
           {autoSeeding ? (
             <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-              <ActivityIndicator color="#fff" style={{ marginRight: 8 }} />
-              <Text style={{ color: '#fff', fontWeight: '600' }}>Auto-seeding...</Text>
+              <ActivityIndicator color={theme.text} style={{ marginRight: 8 }} />
+              <Text style={{ color: theme.text, fontWeight: '600', fontSize: 14 }}>
+                Auto-seeding…
+              </Text>
             </View>
           ) : (
-            <Text style={{ color: '#fff', fontWeight: '600' }}>
-              🔍 Auto-seed next 50 bottles from web
+            <Text style={{ color: theme.accentText, fontWeight: '700', fontSize: 14, letterSpacing: 0.3 }}>
+              Auto-seed next 50
             </Text>
           )}
         </Pressable>
         {!!autoSeedStatus && (
-          <Text style={{ fontSize: 12, color: '#666', marginTop: 6, textAlign: 'center' }}>
+          <Text style={{ fontSize: 12, color: theme.textMuted, marginTop: 8, textAlign: 'center' }}>
             {autoSeedStatus}
           </Text>
         )}
       </View>
 
-      <View style={{ paddingHorizontal: 16, marginBottom: 8 }}>
+      <View style={{ paddingHorizontal: 20, marginTop: 16, marginBottom: 12 }}>
         <TextInput
           value={search}
           onChangeText={setSearch}
-          placeholder="Search products..."
-          placeholderTextColor="#999"
+          placeholder="Search products"
+          placeholderTextColor={theme.textFaint}
           style={{
-            borderWidth: 1,
-            borderColor: '#ddd',
-            borderRadius: 8,
-            paddingHorizontal: 12,
-            paddingVertical: 10,
+            backgroundColor: theme.surface,
+            borderRadius: 10,
+            paddingHorizontal: 14,
+            paddingVertical: 12,
             fontSize: 15,
+            color: theme.text,
           }}
         />
+        <View style={{ flexDirection: 'row', gap: 8, marginTop: 10 }}>
+          <FilterChip label="All" active={filterMode === 'all'} onPress={() => setFilterMode('all')} />
+          <FilterChip
+            label="Missing"
+            active={filterMode === 'missing'}
+            onPress={() => setFilterMode('missing')}
+          />
+          <FilterChip
+            label="Has refs"
+            active={filterMode === 'has'}
+            onPress={() => setFilterMode('has')}
+          />
+        </View>
       </View>
 
       {busy && refs.length === 0 ? (
-        <ActivityIndicator style={{ marginTop: 32 }} />
+        <ActivityIndicator style={{ marginTop: 32 }} color={theme.text} />
       ) : (
         <FlatList
           data={filteredCatalog}
           keyExtractor={(p) => p.id}
-          contentContainerStyle={{ paddingHorizontal: 16, paddingBottom: 32 }}
+          contentContainerStyle={{ paddingHorizontal: 20, paddingBottom: 40 }}
           renderItem={({ item: product }) => {
             const existing = refsByProduct.get(product.name) ?? []
             const isBusyHere = uploadingFor === product.name
             return (
               <View
                 style={{
-                  paddingVertical: 12,
-                  borderBottomWidth: 1,
-                  borderBottomColor: '#eee',
+                  backgroundColor: theme.surface,
+                  borderRadius: 12,
+                  padding: 14,
+                  marginBottom: 10,
+                  borderWidth: 1,
+                  borderColor: theme.border,
                 }}
               >
-                <Text style={{ fontSize: 15, fontWeight: '600' }}>{product.name}</Text>
-                <Text style={{ fontSize: 12, color: '#888', marginBottom: 6 }}>
-                  {existing.length} reference{existing.length === 1 ? '' : 's'}
-                </Text>
+                <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 10 }}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ color: theme.text, fontSize: 14, fontWeight: '600' }}>
+                      {product.name}
+                    </Text>
+                    <Text style={{ color: theme.textFaint, fontSize: 11, marginTop: 2 }}>
+                      {existing.length === 0
+                        ? 'no references'
+                        : `${existing.length} reference${existing.length === 1 ? '' : 's'}`}
+                    </Text>
+                  </View>
+                  {existing.length > 0 && (
+                    <View
+                      style={{
+                        width: 8,
+                        height: 8,
+                        borderRadius: 4,
+                        backgroundColor: theme.success,
+                        marginLeft: 8,
+                      }}
+                    />
+                  )}
+                </View>
+
                 {existing.length > 0 && (
-                  <ScrollView horizontal showsHorizontalScrollIndicator={false} style={{ marginBottom: 6 }}>
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    style={{ marginBottom: 10 }}
+                  >
                     {existing.map((r) => (
                       <Pressable
                         key={r.id}
@@ -308,39 +363,47 @@ export default function References() {
                       >
                         <Image
                           source={{ uri: r.image_url }}
-                          style={{ width: 64, height: 64, borderRadius: 6, backgroundColor: '#eee' }}
+                          style={{
+                            width: 58,
+                            height: 58,
+                            borderRadius: 8,
+                            backgroundColor: theme.surfaceAlt,
+                          }}
                         />
                       </Pressable>
                     ))}
                   </ScrollView>
                 )}
+
                 <View style={{ flexDirection: 'row', gap: 8 }}>
                   <Pressable
                     disabled={isBusyHere}
                     onPress={() => addReferenceFor(product.name, 'camera')}
-                    style={{
-                      paddingVertical: 8,
-                      paddingHorizontal: 12,
-                      backgroundColor: isBusyHere ? '#aaa' : '#007AFF',
-                      borderRadius: 6,
-                    }}
+                    style={({ pressed }) => ({
+                      flex: 1,
+                      paddingVertical: 10,
+                      backgroundColor: pressed ? '#2f2f34' : theme.surfaceAlt,
+                      borderRadius: 8,
+                      alignItems: 'center',
+                    })}
                   >
-                    <Text style={{ color: '#fff', fontSize: 13, fontWeight: '600' }}>
-                      {isBusyHere ? 'Uploading...' : '📷 Snap'}
+                    <Text style={{ color: theme.text, fontSize: 13, fontWeight: '500' }}>
+                      {isBusyHere ? 'Uploading…' : 'Camera'}
                     </Text>
                   </Pressable>
                   <Pressable
                     disabled={isBusyHere}
                     onPress={() => addReferenceFor(product.name, 'library')}
-                    style={{
-                      paddingVertical: 8,
-                      paddingHorizontal: 12,
-                      backgroundColor: isBusyHere ? '#aaa' : '#34C759',
-                      borderRadius: 6,
-                    }}
+                    style={({ pressed }) => ({
+                      flex: 1,
+                      paddingVertical: 10,
+                      backgroundColor: pressed ? '#2f2f34' : theme.surfaceAlt,
+                      borderRadius: 8,
+                      alignItems: 'center',
+                    })}
                   >
-                    <Text style={{ color: '#fff', fontSize: 13, fontWeight: '600' }}>
-                      🖼 Pick
+                    <Text style={{ color: theme.text, fontSize: 13, fontWeight: '500' }}>
+                      Library
                     </Text>
                   </Pressable>
                 </View>
@@ -348,12 +411,58 @@ export default function References() {
             )
           }}
           ListEmptyComponent={
-            <Text style={{ textAlign: 'center', marginTop: 32, color: '#999' }}>
+            <Text
+              style={{
+                textAlign: 'center',
+                marginTop: 32,
+                color: theme.textFaint,
+                fontSize: 13,
+              }}
+            >
               No products match.
             </Text>
           }
         />
       )}
     </View>
+  )
+}
+
+function FilterChip({
+  label,
+  active,
+  onPress,
+}: {
+  label: string
+  active?: boolean
+  onPress: () => void
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => ({
+        paddingVertical: 6,
+        paddingHorizontal: 12,
+        borderRadius: 16,
+        backgroundColor: active
+          ? theme.accent
+          : pressed
+            ? '#26262a'
+            : theme.surface,
+        borderWidth: 1,
+        borderColor: active ? theme.accent : theme.border,
+      })}
+    >
+      <Text
+        style={{
+          color: active ? theme.accentText : theme.textMuted,
+          fontSize: 12,
+          fontWeight: '600',
+          letterSpacing: 0.2,
+        }}
+      >
+        {label}
+      </Text>
+    </Pressable>
   )
 }

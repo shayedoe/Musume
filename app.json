@@ -5,7 +5,8 @@
     "scheme": "musume",
     "version": "1.1.0",
     "orientation": "portrait",
-    "userInterfaceStyle": "automatic",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0b0b0c",
     "plugins": [
       "expo-router",
       "expo-image-picker"

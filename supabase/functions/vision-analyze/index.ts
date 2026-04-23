@@ -121,16 +121,46 @@ Deno.serve(async (req) => {
 
   userContent.push({ type: 'text', text: catalogLine })
 
+  // Fetch reference images server-side and inline them as base64. This avoids
+  // OpenAI's "failed to download image from <url>" errors when their fetcher
+  // can't reach Supabase public storage (rate limits, transient network).
+  const inlinedRefs: Array<{ product: string; dataUrl: string }> = []
   if (references.length) {
+    const fetched = await Promise.all(
+      references.map(async (ref) => {
+        try {
+          const r = await fetch(ref.image_url, {
+            signal: AbortSignal.timeout(6000),
+            headers: { Accept: 'image/*' },
+          })
+          if (!r.ok) return null
+          const ct = (r.headers.get('content-type') || 'image/jpeg').split(';')[0].trim()
+          if (!ct.startsWith('image/')) return null
+          const bytes = new Uint8Array(await r.arrayBuffer())
+          if (bytes.byteLength < 500 || bytes.byteLength > 4_000_000) return null
+          // base64 encode
+          let binary = ''
+          for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i])
+          const b64 = btoa(binary)
+          return { product: ref.product, dataUrl: `data:${ct};base64,${b64}` }
+        } catch {
+          return null
+        }
+      })
+    )
+    for (const f of fetched) if (f) inlinedRefs.push(f)
+  }
+
+  if (inlinedRefs.length) {
     userContent.push({
       type: 'text',
-      text: `REFERENCE GALLERY (${references.length} known products). Use these as ground-truth naming when a shelf bottle matches.`,
+      text: `REFERENCE GALLERY (${inlinedRefs.length} known products). Use these as ground-truth naming when a shelf bottle matches.`,
     })
-    references.forEach((ref, i) => {
+    inlinedRefs.forEach((ref, i) => {
       userContent.push({ type: 'text', text: `Reference #${i + 1}: ${ref.product}` })
       userContent.push({
         type: 'image_url',
-        image_url: { url: ref.image_url, detail: 'low' },
+        image_url: { url: ref.dataUrl, detail: 'low' },
       })
     })
   }

@@ -1,11 +1,21 @@
 import { useEffect, useState } from 'react'
-import { View, Text, Pressable, Alert, ActivityIndicator, Image, ScrollView } from 'react-native'
+import {
+  View,
+  Text,
+  Pressable,
+  Alert,
+  ActivityIndicator,
+  Image,
+  ScrollView,
+  StatusBar,
+} from 'react-native'
 import { useRouter, useLocalSearchParams } from 'expo-router'
 import * as ImagePicker from 'expo-image-picker'
 import * as ImageManipulator from 'expo-image-manipulator'
 import { supabase } from '../lib/supabase'
 import { analyzeShelfImage, mergeDetections } from '../lib/vision'
 import { ensureCatalogSeeded, matchProduct } from '../lib/catalog'
+import { theme } from '../lib/theme'
 import type { Product, VisionDetectionResult } from '../lib/types'
 
 interface LocalShot {
@@ -13,10 +23,6 @@ interface LocalShot {
   base64: string
 }
 
-// Re-encode picker output to real JPEG bytes. iPhones save photos as HEIC; even
-// when ImagePicker returns base64 it can still be HEIC-encoded, which OpenAI
-// rejects with "please make sure your image has one of the following formats
-// ['png','jpeg','gif','webp']".
 async function toJpeg(uri: string): Promise<{ uri: string; base64: string }> {
   const result = await ImageManipulator.manipulateAsync(uri, [{ resize: { width: 1600 } }], {
     compress: 0.8,
@@ -43,7 +49,7 @@ export default function Camera() {
   const addFromCamera = async () => {
     const { status: perm } = await ImagePicker.requestCameraPermissionsAsync()
     if (perm !== 'granted') {
-      Alert.alert('Permission needed', 'Camera permission is required to take photos.')
+      Alert.alert('Permission needed', 'Camera permission is required.')
       return
     }
     const result = await ImagePicker.launchCameraAsync({
@@ -62,7 +68,7 @@ export default function Camera() {
   const addFromLibrary = async () => {
     const { status: perm } = await ImagePicker.requestMediaLibraryPermissionsAsync()
     if (perm !== 'granted') {
-      Alert.alert('Permission needed', 'Photo library permission is required to upload photos.')
+      Alert.alert('Permission needed', 'Photo library permission is required.')
       return
     }
     const result = await ImagePicker.launchImageLibraryAsync({
@@ -74,7 +80,7 @@ export default function Camera() {
       selectionLimit: 6,
     })
     if (!result.canceled) {
-      setStatus('Converting images...')
+      setStatus('Converting...')
       try {
         const next: LocalShot[] = []
         for (const a of result.assets) {
@@ -94,7 +100,7 @@ export default function Camera() {
 
   const analyzeAndUpload = async () => {
     if (shots.length === 0) {
-      Alert.alert('No photos', 'Add at least one shelf photo first.')
+      Alert.alert('No photos', 'Add at least one photo.')
       return
     }
     setBusy(true)
@@ -108,7 +114,7 @@ export default function Camera() {
       if (sessionError) throw sessionError
       const sessionId = (sessionData as any).id as string
 
-      setStatus('Analyzing bottles with AI...')
+      setStatus('Analyzing...')
       const catalogHint = catalog.map((c) => c.name)
       const analyses = await Promise.allSettled(
         shots.map((s) => analyzeShelfImage(s.base64, catalogHint))
@@ -130,10 +136,6 @@ export default function Camera() {
       const photoIds: string[] = []
       for (let i = 0; i < shots.length; i++) {
         const shot = shots[i]
-        // Force JPEG: fetch the in-memory base64 as a data URL, so the blob
-        // always has type image/jpeg regardless of whether the original asset
-        // was HEIC (iPhone default), HEIF, PNG, etc. ImagePicker returns
-        // base64 as JPEG when quality is set.
         const response = await fetch(`data:image/jpeg;base64,${shot.base64}`)
         const blob = await response.blob()
         const fileName = `${sessionId}/${Date.now()}_${i}.jpg`
@@ -153,7 +155,7 @@ export default function Camera() {
         photoIds.push((photoData as any).id)
       }
 
-      setStatus('Saving detections...')
+      setStatus('Saving...')
       const detectionRows: any[] = []
       perPhotoDetections.forEach((dets, i) => {
         const photoId = photoIds[i]
@@ -183,7 +185,7 @@ export default function Camera() {
       if (warnings.length > 0) {
         Alert.alert('Finished with warnings', warnings.slice(0, 4).join('\n'))
       } else if (merged.length === 0) {
-        Alert.alert('No bottles detected', 'Review screen will let you add items manually.')
+        Alert.alert('Nothing detected', 'You can add rows manually on the next screen.')
       }
 
       router.push(`/review?session_id=${sessionId}`)
@@ -196,77 +198,120 @@ export default function Camera() {
   }
 
   return (
-    <ScrollView style={{ flex: 1, backgroundColor: '#fff' }} contentContainerStyle={{ padding: 20 }}>
-      <Text style={{ fontSize: 22, fontWeight: '700', marginBottom: 4 }}>Capture Shelf Photos</Text>
-      <Text style={{ fontSize: 13, color: '#666', marginBottom: 16 }}>
-        Take one or more photos, or upload from your library. The AI will detect bottles, count duplicates,
-        and estimate fill level (1 = full, 0.5 = half, 0.1 = nearly empty).
-      </Text>
+    <View style={{ flex: 1, backgroundColor: theme.bg }}>
+      <StatusBar barStyle="light-content" backgroundColor={theme.bg} />
+      <ScrollView contentContainerStyle={{ padding: 20, paddingTop: 60 }}>
+        <View style={{ flexDirection: 'row', alignItems: 'center', marginBottom: 24 }}>
+          <Pressable onPress={() => router.back()} hitSlop={10} style={{ marginRight: 12 }}>
+            <Text style={{ color: theme.textMuted, fontSize: 15 }}>‹  Back</Text>
+          </Pressable>
+        </View>
 
-      <View style={{ flexDirection: 'row', gap: 10, marginBottom: 16 }}>
-        <Pressable
-          onPress={addFromCamera}
-          style={{ flex: 1, padding: 14, backgroundColor: '#007AFF', borderRadius: 8, alignItems: 'center' }}
-        >
-          <Text style={{ color: '#fff', fontWeight: '600' }}>+ Camera</Text>
-        </Pressable>
-        <Pressable
-          onPress={addFromLibrary}
-          style={{ flex: 1, padding: 14, backgroundColor: '#34C759', borderRadius: 8, alignItems: 'center' }}
-        >
-          <Text style={{ color: '#fff', fontWeight: '600' }}>+ Upload</Text>
-        </Pressable>
-      </View>
-
-      {initialMode === 'library' && shots.length === 0 && (
-        <Text style={{ color: '#888', fontStyle: 'italic', marginBottom: 12 }}>
-          Tip: Upload a photo of your back-bar or stock shelf to test bottle detection.
+        <Text style={{ color: theme.text, fontSize: 26, fontWeight: '700', marginBottom: 22, letterSpacing: 0.2 }}>
+          Capture
         </Text>
-      )}
 
-      <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 16 }}>
-        {shots.map((s, idx) => (
-          <View key={idx} style={{ position: 'relative' }}>
-            <Image source={{ uri: s.uri }} style={{ width: 100, height: 140, borderRadius: 8 }} />
-            <Pressable
-              onPress={() => removeShot(idx)}
-              style={{
-                position: 'absolute', top: 4, right: 4,
-                backgroundColor: 'rgba(0,0,0,0.6)', borderRadius: 12,
-                width: 24, height: 24, alignItems: 'center', justifyContent: 'center',
-              }}
-            >
-              <Text style={{ color: '#fff', fontSize: 14 }}>×</Text>
-            </Pressable>
-          </View>
-        ))}
-      </View>
+        <View style={{ flexDirection: 'row', gap: 10, marginBottom: 18 }}>
+          <ToolbarButton label="Camera" onPress={addFromCamera} active={initialMode === 'camera'} />
+          <ToolbarButton label="Upload" onPress={addFromLibrary} active={initialMode === 'library'} />
+        </View>
 
-      {shots.length > 0 && (
-        <Pressable
-          onPress={analyzeAndUpload}
-          disabled={busy}
-          style={{
-            padding: 16, backgroundColor: busy ? '#ccc' : '#111',
-            borderRadius: 10, alignItems: 'center', marginBottom: 12,
-          }}
-        >
-          {busy ? (
-            <View style={{ alignItems: 'center' }}>
-              <ActivityIndicator color="#fff" />
-              {!!status && <Text style={{ color: '#fff', marginTop: 6 }}>{status}</Text>}
+        {!!status && !busy && (
+          <Text style={{ color: theme.textMuted, fontSize: 13, marginBottom: 12 }}>{status}</Text>
+        )}
+
+        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginBottom: 22 }}>
+          {shots.map((s, idx) => (
+            <View key={idx} style={{ position: 'relative' }}>
+              <Image
+                source={{ uri: s.uri }}
+                style={{
+                  width: 100,
+                  height: 140,
+                  borderRadius: 10,
+                  backgroundColor: theme.surface,
+                }}
+              />
+              <Pressable
+                onPress={() => removeShot(idx)}
+                style={{
+                  position: 'absolute',
+                  top: 6,
+                  right: 6,
+                  backgroundColor: 'rgba(0,0,0,0.7)',
+                  borderRadius: 12,
+                  width: 24,
+                  height: 24,
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                }}
+              >
+                <Text style={{ color: '#fff', fontSize: 14, lineHeight: 16 }}>×</Text>
+              </Pressable>
             </View>
-          ) : (
-            <Text style={{ color: '#fff', fontSize: 16, fontWeight: '700' }}>
-              Analyze {shots.length} photo{shots.length > 1 ? 's' : ''}
+          ))}
+          {shots.length === 0 && (
+            <Text style={{ color: theme.textFaint, fontSize: 13, fontStyle: 'italic' }}>
+              No photos yet.
             </Text>
           )}
-        </Pressable>
-      )}
+        </View>
 
-      <Pressable onPress={() => router.back()} style={{ padding: 12, alignItems: 'center' }}>
-        <Text style={{ color: '#007AFF' }}>Back</Text>
-      </Pressable>
-    </ScrollView>
+        {shots.length > 0 && (
+          <Pressable
+            onPress={analyzeAndUpload}
+            disabled={busy}
+            style={({ pressed }) => ({
+              padding: 18,
+              backgroundColor: busy ? theme.surfaceAlt : pressed ? '#e7e7e9' : theme.accent,
+              borderRadius: 12,
+              alignItems: 'center',
+            })}
+          >
+            {busy ? (
+              <View style={{ alignItems: 'center' }}>
+                <ActivityIndicator color={theme.text} />
+                {!!status && (
+                  <Text style={{ color: theme.text, marginTop: 6, fontSize: 13 }}>{status}</Text>
+                )}
+              </View>
+            ) : (
+              <Text style={{ color: theme.accentText, fontSize: 16, fontWeight: '700', letterSpacing: 0.3 }}>
+                Analyze {shots.length} photo{shots.length > 1 ? 's' : ''}
+              </Text>
+            )}
+          </Pressable>
+        )}
+      </ScrollView>
+    </View>
+  )
+}
+
+function ToolbarButton({
+  label,
+  onPress,
+  active,
+}: {
+  label: string
+  onPress: () => void
+  active?: boolean
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => ({
+        flex: 1,
+        paddingVertical: 14,
+        borderRadius: 10,
+        alignItems: 'center',
+        backgroundColor: pressed ? '#26262a' : active ? theme.surfaceAlt : theme.surface,
+        borderWidth: 1,
+        borderColor: active ? theme.border : 'transparent',
+      })}
+    >
+      <Text style={{ color: theme.text, fontSize: 14, fontWeight: '600', letterSpacing: 0.2 }}>
+        {label}
+      </Text>
+    </Pressable>
   )
 }
