@@ -40,26 +40,25 @@ export default function Camera() {
     setLoading(true)
     try {
       // Create inventory session
-      const { data: sessionData, error: sessionError } = await supabase
+      const { data: sessionData, error: sessionError } = (await (supabase as any)
         .from('inventory_sessions')
-        .insert({})
+        .insert({} as any)
         .select()
-        .single()
+        .single()) as any
 
       if (sessionError) throw sessionError
 
-      // Read image file
-      const base64 = await FileSystem.readAsStringAsync(imageUri, {
-        encoding: FileSystem.EncodingType.Base64,
-      })
+      // Read image file as blob
+      const response = await fetch(imageUri)
+      const blob = await response.blob()
 
       // Generate unique filename
-      const fileName = `${sessionData.id}/${Date.now()}.jpg`
+      const fileName = `${(sessionData as any).id}/${Date.now()}.jpg`
 
       // Upload to Supabase storage
       const { error: uploadError } = await supabase.storage
         .from('inventory-images')
-        .upload(fileName, decode(base64), {
+        .upload(fileName, blob, {
           contentType: 'image/jpeg',
         })
 
@@ -71,17 +70,17 @@ export default function Camera() {
         .getPublicUrl(fileName)
 
       // Save photo record
-      const { error: photoError } = await supabase
+      const { error: photoError } = await ((supabase as any)
         .from('photos')
         .insert({
-          session_id: sessionData.id,
-          image_url: urlData.publicUrl,
-        })
+          session_id: (sessionData as any).id,
+          image_url: (urlData as any).publicUrl,
+        } as any) as any)
 
       if (photoError) throw photoError
 
       // Navigate to review screen
-      router.push(`/review?session_id=${sessionData.id}`)
+      router.push(`/review?session_id=${(sessionData as any).id}`)
     } catch (error: any) {
       Alert.alert('Error', error.message || 'Failed to upload image')
     } finally {
@@ -153,12 +152,4 @@ export default function Camera() {
   )
 }
 
-// Helper function to decode base64 to Uint8Array
-function decode(base64: string): Uint8Array {
-  const binaryString = atob(base64)
-  const bytes = new Uint8Array(binaryString.length)
-  for (let i = 0; i < binaryString.length; i++) {
-    bytes[i] = binaryString.charCodeAt(i)
-  }
-  return bytes
-}
+// no-op: blob upload handled via fetch

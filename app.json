@@ -16,15 +16,20 @@
       "infoPlist": {
         "NSCameraUsageDescription": "Use the camera to capture inventory shelf photos.",
         "NSPhotoLibraryUsageDescription": "Use the photo library to upload inventory shelf photos.",
-        "NSPhotoLibraryAddUsageDescription": "Save exported inventory files when needed."
+        "NSPhotoLibraryAddUsageDescription": "Save exported inventory files when needed.",
+        "ITSAppUsesNonExemptEncryption": false
       }
     },
     "extra": {
       "supabaseUrl": "https://txgcqrymhuiivecpcsnh.supabase.co",
       "supabaseAnonKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+      "router": {
+        "origin": false
+      },
       "eas": {
-        "projectId": "REPLACE_WITH_EAS_PROJECT_ID"
+        "projectId": "3001b491-fdf2-43ce-a93c-c396fcb71b1e"
       }
-    }
+    },
+    "owner": "brettb17"
   }
 }

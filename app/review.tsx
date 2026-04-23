@@ -29,25 +29,25 @@ export default function Review() {
   const loadSessionData = async () => {
     try {
       // Load photo for this session
-      const { data: photoData, error: photoError } = await supabase
+      const { data: photoData, error: photoError } = (await supabase
         .from('photos')
         .select('image_url')
         .eq('session_id', session_id)
-        .single()
+        .single()) as any
 
       if (photoError) throw photoError
-      setImageUrl(photoData.image_url)
+      setImageUrl((photoData as any).image_url)
 
       // Load existing counts if any
-      const { data: countsData, error: countsError } = await supabase
+      const { data: countsData, error: countsError } = (await (supabase as any)
         .from('final_counts')
         .select('*')
-        .eq('session_id', session_id)
+        .eq('session_id', session_id)) as any
 
       if (countsError && countsError.code !== 'PGRST116') throw countsError
 
       if (countsData && countsData.length > 0) {
-        setCounts(countsData.map((c: any, idx: number) => ({
+        setCounts((countsData as any).map((c: any, idx: number) => ({
           id: String(idx + 1),
           product: c.product || '',
           quantity: String(c.quantity || ''),
@@ -109,14 +109,14 @@ export default function Review() {
         return
       }
 
-      const { error } = await supabase
+      const { error } = await ((supabase as any)
         .from('final_counts')
         .insert(parsedCounts.map((c) => ({
           session_id,
           product: c.product,
           quantity: c.parsedQuantity,
           section: c.section
-        })))
+        })) as any) as any)
 
       if (error) throw error
       Alert.alert('Success', 'Counts saved successfully')
