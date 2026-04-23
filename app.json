@@ -31,8 +31,7 @@
     "extra": {
       "supabaseUrl": "https://txgcqrymhuiivecpcsnh.supabase.co",
       "supabaseAnonKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-      "visionEndpoint": "",
-      "openaiApiKey": "REDACTED",
+      "visionEndpoint": "https://txgcqrymhuiivecpcsnh.functions.supabase.co/vision-analyze",
       "router": {
         "origin": false
       },
