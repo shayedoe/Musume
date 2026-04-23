@@ -15,40 +15,18 @@ import * as Sharing from 'expo-sharing'
 import { File, Paths } from 'expo-file-system'
 import { supabase } from '../lib/supabase'
 import { theme } from '../lib/theme'
-import type { BottleAnnotation, FillLevel } from '../lib/types'
+import type { BottleAnnotation } from '../lib/types'
 
 interface ReviewRow {
   id: string
   detectionId?: string
   product: string
   count: string
-  fill: FillLevel
   confidence?: number | null
   notes?: string | null
   isManual?: boolean
-}
-
-const FILL_OPTIONS: { label: string; value: FillLevel }[] = [
-  { label: 'Full', value: 1 },
-  { label: 'Half', value: 0.5 },
-  { label: 'Low', value: 0.1 },
-  { label: 'Empty', value: 0 },
-]
-
-function snapFill(value: unknown): FillLevel {
-  const n = typeof value === 'number' ? value : parseFloat(String(value))
-  if (!Number.isFinite(n)) return 1
-  const buckets: FillLevel[] = [1, 0.5, 0.1, 0]
-  let best: FillLevel = 1
-  let bestDelta = Infinity
-  for (const b of buckets) {
-    const d = Math.abs(n - b)
-    if (d < bestDelta) {
-      bestDelta = d
-      best = b
-    }
-  }
-  return best
+  unitPrice?: number | null
+  thumbUrl?: string | null
 }
 
 export default function Review() {
@@ -56,9 +34,12 @@ export default function Review() {
   const { session_id } = useLocalSearchParams<{ session_id: string }>()
   const [loading, setLoading] = useState(true)
   const [exporting, setExporting] = useState(false)
-  const [imageUrls, setImageUrls] = useState<string[]>([])
-  const [annotationsByUrl, setAnnotationsByUrl] = useState<Record<string, BottleAnnotation[]>>({})
+  const [photos, setPhotos] = useState<{ url: string; annotations: BottleAnnotation[] }[]>([])
   const [rows, setRows] = useState<ReviewRow[]>([])
+  // product-name (lowercase) -> { unit_price, thumb_url }
+  const [productMeta, setProductMeta] = useState<
+    Record<string, { price: number | null; thumb: string | null }>
+  >({})
 
   useEffect(() => {
     loadSessionData()
@@ -67,37 +48,99 @@ export default function Review() {
 
   const loadSessionData = async () => {
     try {
-      const { data: photoData } = await (supabase as any)
-        .from('photos')
-        .select('image_url, annotations')
-        .eq('session_id', session_id)
-      const photos = ((photoData as any[]) ?? [])
-      setImageUrls(photos.map((p) => p.image_url))
-      const map: Record<string, BottleAnnotation[]> = {}
-      for (const p of photos) {
-        if (Array.isArray(p.annotations)) {
-          map[p.image_url] = p.annotations as BottleAnnotation[]
+      // Photos with annotations. Fall back if the column doesn't exist yet.
+      let photoRows: any[] = []
+      {
+        const { data, error } = await (supabase as any)
+          .from('photos')
+          .select('image_url, annotations')
+          .eq('session_id', session_id)
+        if (error) {
+          const fallback = await (supabase as any)
+            .from('photos')
+            .select('image_url')
+            .eq('session_id', session_id)
+          photoRows = (fallback.data as any[]) ?? []
+        } else {
+          photoRows = (data as any[]) ?? []
         }
       }
-      setAnnotationsByUrl(map)
+      const loadedPhotos = photoRows.map((p) => ({
+        url: p.image_url as string,
+        annotations: Array.isArray(p.annotations) ? (p.annotations as BottleAnnotation[]) : [],
+      }))
+      setPhotos(loadedPhotos)
 
       const { data: detData } = await (supabase as any)
         .from('detections')
         .select('*')
         .eq('session_id', session_id)
 
-      const detectionRows: ReviewRow[] = ((detData as any[]) ?? []).map((d: any, i: number) => ({
-        id: `d-${d.id ?? i}`,
-        detectionId: d.id,
-        product: d.predicted_product ?? '',
-        count: String(d.count ?? 1),
-        fill: snapFill(d.fill_level),
-        confidence: d.confidence,
-        notes: d.notes,
-      }))
+      // Pull product prices + reference thumbnails for the bottles we need.
+      const productNames = new Set<string>(
+        ((detData as any[]) ?? [])
+          .map((d: any) => String(d.predicted_product ?? '').toLowerCase().trim())
+          .filter(Boolean)
+      )
+      const meta: Record<string, { price: number | null; thumb: string | null }> = {}
+
+      if (productNames.size > 0) {
+        // Prices from `products` table. unit_price may not exist in older DBs.
+        let priceRows: any[] = []
+        try {
+          const res = await (supabase as any)
+            .from('products')
+            .select('name, unit_price')
+          priceRows = (res.data as any[]) ?? []
+        } catch {
+          priceRows = []
+        }
+        for (const p of priceRows) {
+          const key = String(p.name ?? '').toLowerCase().trim()
+          if (!key) continue
+          meta[key] = {
+            price: p.unit_price != null ? Number(p.unit_price) : null,
+            thumb: null,
+          }
+        }
+        // Reference photos — best single thumbnail per product_name.
+        try {
+          const res = await (supabase as any)
+            .from('bottle_references')
+            .select('product_name, image_url, priority')
+            .order('priority', { ascending: true })
+          const refs = (res.data as any[]) ?? []
+          for (const r of refs) {
+            const key = String(r.product_name ?? '').toLowerCase().trim()
+            if (!key) continue
+            if (!meta[key]) meta[key] = { price: null, thumb: null }
+            if (!meta[key].thumb) meta[key].thumb = r.image_url ?? null
+          }
+        } catch {
+          /* non-fatal */
+        }
+      }
+      setProductMeta(meta)
+
+      const detectionRows: ReviewRow[] = ((detData as any[]) ?? []).map(
+        (d: any, i: number) => {
+          const pname = String(d.predicted_product ?? '')
+          const key = pname.toLowerCase().trim()
+          return {
+            id: `d-${d.id ?? i}`,
+            detectionId: d.id,
+            product: pname,
+            count: String(d.count ?? 1),
+            confidence: d.confidence,
+            notes: d.notes,
+            unitPrice: meta[key]?.price ?? null,
+            thumbUrl: meta[key]?.thumb ?? null,
+          }
+        }
+      )
 
       if (detectionRows.length === 0) {
-        setRows([{ id: 'm-1', product: '', count: '1', fill: 1, isManual: true }])
+        setRows([{ id: 'm-1', product: '', count: '1', isManual: true }])
       } else {
         setRows(detectionRows)
       }
@@ -109,36 +152,85 @@ export default function Review() {
   }
 
   const updateRow = (id: string, patch: Partial<ReviewRow>) => {
-    setRows((prev) => prev.map((r) => (r.id === id ? { ...r, ...patch } : r)))
+    setRows((prev) =>
+      prev.map((r) => {
+        if (r.id !== id) return r
+        const next = { ...r, ...patch }
+        // Refresh thumb/price if product name changed
+        if (patch.product !== undefined) {
+          const key = (patch.product as string).toLowerCase().trim()
+          const m = productMeta[key]
+          next.unitPrice = m?.price ?? null
+          next.thumbUrl = m?.thumb ?? null
+        }
+        return next
+      })
+    )
   }
+
+  const bumpCount = (id: string, delta: number) => {
+    setRows((prev) =>
+      prev.map((r) => {
+        if (r.id !== id) return r
+        const n = parseInt(r.count, 10)
+        const base = Number.isFinite(n) ? n : 0
+        const next = Math.max(0, base + delta)
+        return { ...r, count: String(next) }
+      })
+    )
+  }
+
   const removeRow = (id: string) => {
     setRows((prev) => (prev.length > 1 ? prev.filter((r) => r.id !== id) : prev))
   }
   const addManualRow = () => {
     setRows((prev) => [
       ...prev,
-      { id: `m-${Date.now()}`, product: '', count: '1', fill: 1, isManual: true },
+      { id: `m-${Date.now()}`, product: '', count: '1', isManual: true },
     ])
   }
 
   const finals = useMemo(() => {
-    const bucket = new Map<string, { product: string; quantity: number }>()
+    // Full-only: quantity = integer count
+    const bucket = new Map<
+      string,
+      { product: string; quantity: number; totalValue: number; hasPrice: boolean }
+    >()
     for (const r of rows) {
       const name = r.product.trim()
       if (!name) continue
-      const c = parseFloat(r.count)
+      const c = parseInt(r.count, 10)
       if (!Number.isFinite(c) || c <= 0) continue
-      const qty = c * r.fill
       const key = name.toLowerCase()
+      const price = r.unitPrice ?? null
       const existing = bucket.get(key)
-      if (existing) existing.quantity += qty
-      else bucket.set(key, { product: name, quantity: qty })
+      if (existing) {
+        existing.quantity += c
+        if (price != null) {
+          existing.totalValue += c * price
+          existing.hasPrice = true
+        }
+      } else {
+        bucket.set(key, {
+          product: name,
+          quantity: c,
+          totalValue: price != null ? c * price : 0,
+          hasPrice: price != null,
+        })
+      }
     }
-    return Array.from(bucket.values()).map((b) => ({
-      ...b,
-      quantity: Math.round(b.quantity * 100) / 100,
-    }))
+    return Array.from(bucket.values())
   }, [rows])
+
+  const grandTotal = useMemo(() => {
+    let sum = 0
+    let partial = false
+    for (const f of finals) {
+      if (f.hasPrice) sum += f.totalValue
+      else if (f.quantity > 0) partial = true
+    }
+    return { sum: Math.round(sum * 100) / 100, partial }
+  }, [finals])
 
   const saveCounts = async () => {
     try {
@@ -146,7 +238,13 @@ export default function Review() {
       await (supabase as any).from('final_counts').delete().eq('session_id', session_id)
       const { error } = await (supabase as any)
         .from('final_counts')
-        .insert(finals.map((f) => ({ session_id, ...f })) as any)
+        .insert(
+          finals.map((f) => ({
+            session_id,
+            product: f.product,
+            quantity: f.quantity,
+          })) as any
+        )
       if (error) throw error
       Alert.alert('Saved', `${finals.length} line${finals.length > 1 ? 's' : ''} saved.`)
     } catch (error: any) {
@@ -158,9 +256,12 @@ export default function Review() {
     setExporting(true)
     try {
       if (finals.length === 0) return Alert.alert('No data', 'Nothing to export.')
-      const header = 'Product,Count,Unit\n'
+      const header = 'Product,Count,Unit,Value\n'
       const body = finals
-        .map((f) => `"${f.product.replace(/"/g, '""')}",${f.quantity},bottle`)
+        .map((f) => {
+          const val = f.hasPrice ? f.totalValue.toFixed(2) : ''
+          return `"${f.product.replace(/"/g, '""')}",${f.quantity},bottle,${val}`
+        })
         .join('\n')
       const csv = header + body
       const fileName = `inventory_${session_id}_${Date.now()}.csv`
@@ -189,6 +290,8 @@ export default function Review() {
     )
   }
 
+  const hasAnyBoxes = photos.some((p) => p.annotations.length > 0)
+
   return (
     <View style={{ flex: 1, backgroundColor: theme.bg }}>
       <StatusBar barStyle="light-content" backgroundColor={theme.bg} />
@@ -204,11 +307,11 @@ export default function Review() {
           </Text>
           <Text style={{ color: theme.textMuted, fontSize: 13, marginTop: 4 }}>
             {rows.length} line{rows.length === 1 ? '' : 's'} · {finals.length} product
-            {finals.length === 1 ? '' : 's'} · final qty = count × fill
+            {finals.length === 1 ? '' : 's'}
           </Text>
         </View>
 
-        {imageUrls.length > 0 && (
+        {photos.length > 0 && (
           <>
             <ScrollView
               horizontal
@@ -216,15 +319,11 @@ export default function Review() {
               style={{ marginTop: 16 }}
               contentContainerStyle={{ paddingHorizontal: 20, gap: 12 }}
             >
-              {imageUrls.map((url) => (
-                <AnnotatedPhoto
-                  key={url}
-                  url={url}
-                  annotations={annotationsByUrl[url] ?? []}
-                />
+              {photos.map((p, i) => (
+                <AnnotatedPhoto key={`${p.url}-${i}`} url={p.url} annotations={p.annotations} />
               ))}
             </ScrollView>
-            {Object.values(annotationsByUrl).some((a) => a.length > 0) && (
+            {hasAnyBoxes && (
               <View
                 style={{
                   flexDirection: 'row',
@@ -234,7 +333,7 @@ export default function Review() {
                   flexWrap: 'wrap',
                 }}
               >
-                <LegendDot color="#22c55e" label="Matched reference" />
+                <LegendDot color="#22c55e" label="Matched" />
                 <LegendDot color="#eab308" label="Identified" />
                 <LegendDot color="#ef4444" label="Unknown" />
               </View>
@@ -242,149 +341,134 @@ export default function Review() {
           </>
         )}
 
-        {/* Compact table: product · count · fill · remove */}
+        {/* Rows */}
         <View style={{ paddingHorizontal: 20, marginTop: 20 }}>
-          <View
-            style={{
-              flexDirection: 'row',
-              paddingHorizontal: 12,
-              paddingBottom: 6,
-            }}
-          >
-            <Text style={{ flex: 1, fontSize: 11, color: theme.textFaint, letterSpacing: 0.6, textTransform: 'uppercase' }}>
-              Product
-            </Text>
-            <Text style={{ width: 48, fontSize: 11, color: theme.textFaint, letterSpacing: 0.6, textTransform: 'uppercase', textAlign: 'center' }}>
-              Qty
-            </Text>
-            <Text style={{ width: 56, fontSize: 11, color: theme.textFaint, letterSpacing: 0.6, textTransform: 'uppercase', textAlign: 'right' }}>
-              Final
-            </Text>
-          </View>
-
-          {rows.map((r) => {
-            const finalQty = ((parseFloat(r.count) || 0) * r.fill).toFixed(2)
-            return (
-              <View
-                key={r.id}
-                style={{
-                  backgroundColor: theme.surface,
-                  borderRadius: 12,
-                  padding: 12,
-                  marginBottom: 8,
-                  borderWidth: 1,
-                  borderColor: r.isManual ? '#3a3a40' : theme.border,
-                }}
-              >
-                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                  <TextInput
-                    placeholder="Product"
-                    placeholderTextColor={theme.textFaint}
-                    value={r.product}
-                    onChangeText={(text) => updateRow(r.id, { product: text })}
-                    style={{
-                      flex: 1,
-                      color: theme.text,
-                      fontSize: 14,
-                      paddingVertical: 4,
-                    }}
-                  />
-                  <TextInput
-                    value={r.count}
-                    onChangeText={(text) => updateRow(r.id, { count: text })}
-                    keyboardType="number-pad"
-                    style={{
-                      width: 48,
-                      backgroundColor: theme.surfaceAlt,
-                      color: theme.text,
-                      borderRadius: 6,
-                      paddingVertical: 6,
-                      paddingHorizontal: 6,
-                      fontSize: 14,
-                      textAlign: 'center',
-                    }}
-                  />
-                  <Text
-                    style={{
-                      width: 56,
-                      color: theme.textMuted,
-                      fontSize: 13,
-                      textAlign: 'right',
-                      fontVariant: ['tabular-nums'],
-                    }}
-                  >
-                    {finalQty}
-                  </Text>
-                </View>
-
+          {rows.map((r) => (
+            <View
+              key={r.id}
+              style={{
+                backgroundColor: theme.surface,
+                borderRadius: 12,
+                padding: 12,
+                marginBottom: 8,
+                borderWidth: 1,
+                borderColor: r.isManual ? '#3a3a40' : theme.border,
+              }}
+            >
+              <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                {/* Bottle thumbnail */}
                 <View
                   style={{
-                    flexDirection: 'row',
+                    width: 40,
+                    height: 40,
+                    borderRadius: 6,
+                    backgroundColor: theme.surfaceAlt,
+                    marginRight: 10,
+                    overflow: 'hidden',
                     alignItems: 'center',
-                    marginTop: 10,
-                    gap: 6,
+                    justifyContent: 'center',
                   }}
                 >
-                  {FILL_OPTIONS.map((opt) => {
-                    const selected = r.fill === opt.value
-                    return (
-                      <Pressable
-                        key={opt.value}
-                        onPress={() => updateRow(r.id, { fill: opt.value })}
-                        style={({ pressed }) => ({
-                          paddingVertical: 5,
-                          paddingHorizontal: 10,
-                          borderRadius: 14,
-                          backgroundColor: selected
-                            ? theme.accent
-                            : pressed
-                              ? '#2a2a2f'
-                              : theme.surfaceAlt,
-                        })}
-                      >
-                        <Text
-                          style={{
-                            color: selected ? theme.accentText : theme.textMuted,
-                            fontSize: 11,
-                            fontWeight: '600',
-                            letterSpacing: 0.2,
-                          }}
-                        >
-                          {opt.label}
-                        </Text>
-                      </Pressable>
-                    )
-                  })}
-                  <View style={{ flex: 1 }} />
-                  {rows.length > 1 && (
-                    <Pressable onPress={() => removeRow(r.id)} hitSlop={8}>
-                      <Text style={{ color: theme.danger, fontSize: 11, fontWeight: '600' }}>
-                        REMOVE
-                      </Text>
-                    </Pressable>
+                  {r.thumbUrl ? (
+                    <Image
+                      source={{ uri: r.thumbUrl }}
+                      style={{ width: 40, height: 40 }}
+                      resizeMode="cover"
+                    />
+                  ) : (
+                    <Text style={{ color: theme.textFaint, fontSize: 10 }}>—</Text>
                   )}
                 </View>
 
-                {(r.confidence != null || r.isManual) && (
+                <TextInput
+                  placeholder="Product"
+                  placeholderTextColor={theme.textFaint}
+                  value={r.product}
+                  onChangeText={(text) => updateRow(r.id, { product: text })}
+                  style={{
+                    flex: 1,
+                    color: theme.text,
+                    fontSize: 14,
+                    paddingVertical: 4,
+                  }}
+                />
+              </View>
+
+              {/* Count controls */}
+              <View
+                style={{
+                  flexDirection: 'row',
+                  alignItems: 'center',
+                  marginTop: 10,
+                  gap: 8,
+                }}
+              >
+                <Pressable
+                  onPress={() => bumpCount(r.id, -1)}
+                  style={({ pressed }) => ({
+                    width: 32,
+                    height: 32,
+                    borderRadius: 8,
+                    backgroundColor: pressed ? '#2a2a2f' : theme.surfaceAlt,
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  })}
+                  hitSlop={6}
+                >
+                  <Text style={{ color: theme.text, fontSize: 18, fontWeight: '600' }}>−</Text>
+                </Pressable>
+                <TextInput
+                  value={r.count}
+                  onChangeText={(text) => updateRow(r.id, { count: text })}
+                  keyboardType="number-pad"
+                  style={{
+                    width: 56,
+                    backgroundColor: theme.surfaceAlt,
+                    color: theme.text,
+                    borderRadius: 6,
+                    paddingVertical: 6,
+                    paddingHorizontal: 6,
+                    fontSize: 15,
+                    textAlign: 'center',
+                    fontWeight: '600',
+                  }}
+                />
+                <Pressable
+                  onPress={() => bumpCount(r.id, 1)}
+                  style={({ pressed }) => ({
+                    width: 32,
+                    height: 32,
+                    borderRadius: 8,
+                    backgroundColor: pressed ? '#2a2a2f' : theme.surfaceAlt,
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                  })}
+                  hitSlop={6}
+                >
+                  <Text style={{ color: theme.text, fontSize: 18, fontWeight: '600' }}>+</Text>
+                </Pressable>
+                <View style={{ flex: 1 }} />
+                {r.unitPrice != null && (
                   <Text
                     style={{
-                      color: theme.textFaint,
-                      fontSize: 10,
-                      marginTop: 6,
-                      letterSpacing: 0.4,
-                      textTransform: 'uppercase',
+                      color: theme.textMuted,
+                      fontSize: 12,
+                      fontVariant: ['tabular-nums'],
                     }}
                   >
-                    {r.isManual
-                      ? 'Manual'
-                      : r.confidence != null
-                        ? `Conf ${(r.confidence * 100).toFixed(0)}%`
-                        : ''}
+                    ${(r.unitPrice * (parseInt(r.count, 10) || 0)).toFixed(2)}
                   </Text>
                 )}
+                {rows.length > 1 && (
+                  <Pressable onPress={() => removeRow(r.id)} hitSlop={8}>
+                    <Text style={{ color: theme.danger, fontSize: 11, fontWeight: '600' }}>
+                      REMOVE
+                    </Text>
+                  </Pressable>
+                )}
               </View>
-            )
-          })}
+            </View>
+          ))}
 
           <Pressable
             onPress={addManualRow}
@@ -404,7 +488,7 @@ export default function Review() {
           </Pressable>
         </View>
 
-        {/* Final counts summary */}
+        {/* Summary */}
         <View
           style={{
             marginHorizontal: 20,
@@ -425,7 +509,7 @@ export default function Review() {
               marginBottom: 10,
             }}
           >
-            Export preview · {finals.length} product{finals.length === 1 ? '' : 's'}
+            Summary · {finals.length} product{finals.length === 1 ? '' : 's'}
           </Text>
           {finals.slice(0, 10).map((f, i) => (
             <View
@@ -446,9 +530,22 @@ export default function Review() {
                   fontSize: 13,
                   fontVariant: ['tabular-nums'],
                   fontWeight: '600',
+                  width: 40,
+                  textAlign: 'right',
                 }}
               >
                 {f.quantity}
+              </Text>
+              <Text
+                style={{
+                  color: f.hasPrice ? theme.text : theme.textFaint,
+                  fontSize: 13,
+                  fontVariant: ['tabular-nums'],
+                  width: 70,
+                  textAlign: 'right',
+                }}
+              >
+                {f.hasPrice ? `$${f.totalValue.toFixed(2)}` : '—'}
               </Text>
             </View>
           ))}
@@ -460,6 +557,37 @@ export default function Review() {
           {finals.length === 0 && (
             <Text style={{ color: theme.textFaint, fontSize: 12, fontStyle: 'italic' }}>
               No rows yet.
+            </Text>
+          )}
+
+          {finals.length > 0 && (
+            <View
+              style={{
+                flexDirection: 'row',
+                paddingTop: 10,
+                marginTop: 6,
+                borderTopWidth: 1,
+                borderColor: theme.border,
+              }}
+            >
+              <Text style={{ flex: 1, color: theme.text, fontSize: 14, fontWeight: '700' }}>
+                Total Value{grandTotal.partial ? ' (partial)' : ''}
+              </Text>
+              <Text
+                style={{
+                  color: theme.text,
+                  fontSize: 14,
+                  fontWeight: '700',
+                  fontVariant: ['tabular-nums'],
+                }}
+              >
+                ${grandTotal.sum.toFixed(2)}
+              </Text>
+            </View>
+          )}
+          {grandTotal.partial && (
+            <Text style={{ color: theme.textFaint, fontSize: 11, marginTop: 4 }}>
+              Some products don't have a unit price yet.
             </Text>
           )}
         </View>
@@ -509,9 +637,9 @@ export default function Review() {
 // ---------- Annotated photo overlay ----------
 
 const STATUS_COLORS: Record<BottleAnnotation['status'], string> = {
-  matched: '#22c55e', // green
-  identified: '#eab308', // yellow
-  unknown: '#ef4444', // red
+  matched: '#22c55e',
+  identified: '#eab308',
+  unknown: '#ef4444',
 }
 
 function AnnotatedPhoto({
@@ -522,9 +650,20 @@ function AnnotatedPhoto({
   annotations: BottleAnnotation[]
 }) {
   const [dims, setDims] = useState<{ w: number; h: number } | null>(null)
-  // Preview size — tall enough to see bottles clearly, still fits in horizontal strip.
-  const W = 220
-  const H = 300
+  const W = 240
+  const H = 320
+
+  // Compute the visible rect of the image (cover resize crops out the rest).
+  let scaleX = W, scaleY = H, offsetX = 0, offsetY = 0
+  if (dims) {
+    const scale = Math.max(W / dims.w, H / dims.h)
+    const displayW = dims.w * scale
+    const displayH = dims.h * scale
+    offsetX = (W - displayW) / 2
+    offsetY = (H - displayH) / 2
+    scaleX = displayW
+    scaleY = displayH
+  }
 
   return (
     <View
@@ -542,54 +681,36 @@ function AnnotatedPhoto({
         style={{ width: W, height: H }}
         resizeMode="cover"
         onLoad={(e) => {
-          const src = e.nativeEvent?.source
+          const src: any = e.nativeEvent?.source
           if (src && typeof src.width === 'number' && typeof src.height === 'number') {
             setDims({ w: src.width, h: src.height })
           }
         }}
       />
-      {annotations.length > 0 &&
-        annotations.map((a, i) => {
-          // bbox is normalized [0,1] relative to the ORIGINAL image.
-          // With resizeMode="cover", the image is scaled so min dim fills
-          // and the other dim is cropped. Compute the visible rect.
-          let scaleX = 1, scaleY = 1, offsetX = 0, offsetY = 0
-          if (dims) {
-            const scale = Math.max(W / dims.w, H / dims.h)
-            const displayW = dims.w * scale
-            const displayH = dims.h * scale
-            offsetX = (W - displayW) / 2
-            offsetY = (H - displayH) / 2
-            scaleX = displayW
-            scaleY = displayH
-          } else {
-            // Fallback: assume no crop (1:1 mapping)
-            scaleX = W
-            scaleY = H
-          }
-          const [bx, by, bw, bh] = a.bbox
-          const left = offsetX + bx * scaleX
-          const top = offsetY + by * scaleY
-          const width = bw * scaleX
-          const height = bh * scaleY
-          const color = STATUS_COLORS[a.status] ?? STATUS_COLORS.unknown
-          return (
-            <View
-              key={i}
-              pointerEvents="none"
-              style={{
-                position: 'absolute',
-                left,
-                top,
-                width,
-                height,
-                borderColor: color,
-                borderWidth: 1.5,
-                borderRadius: 2,
-              }}
-            />
-          )
-        })}
+      {annotations.map((a, i) => {
+        const [bx, by, bw, bh] = a.bbox
+        const left = offsetX + bx * scaleX
+        const top = offsetY + by * scaleY
+        const width = bw * scaleX
+        const height = bh * scaleY
+        const color = STATUS_COLORS[a.status] ?? STATUS_COLORS.unknown
+        return (
+          <View
+            key={i}
+            pointerEvents="none"
+            style={{
+              position: 'absolute',
+              left,
+              top,
+              width,
+              height,
+              borderColor: color,
+              borderWidth: 1.5,
+              borderRadius: 2,
+            }}
+          />
+        )
+      })}
       {annotations.length > 0 && (
         <View
           style={{

@@ -566,21 +566,10 @@ async function identifyBottleCrop(
   content.push({ type: 'image_url', image_url: { url: cropDataUrl, detail: 'low' } })
 
   try {
-    let raw: any = null
-    // Try up to 2 times — OpenAI sometimes returns a malformed JSON on
-    // the first shot for close-up crops. Retrying cuts "Unknown bottle"
-    // rate roughly in half in testing.
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        raw = await callOpenAI([
-          { role: 'system', content: SKU_ID_PROMPT },
-          { role: 'user', content },
-        ])
-        if (raw && typeof raw.product === 'string' && raw.product.trim()) break
-      } catch {
-        /* retry */
-      }
-    }
+    const raw = await callOpenAI([
+      { role: 'system', content: SKU_ID_PROMPT },
+      { role: 'user', content },
+    ])
     const product = String(raw?.product ?? '').trim()
     if (!product) return null
     return {
@@ -607,12 +596,6 @@ async function detectWithRoboflow(
     confidence: number
     barcode: string | null
     notes: string | null
-  }>
-  annotations: Array<{
-    bbox: [number, number, number, number] // normalized x, y, w, h in [0,1]
-    product: string
-    status: 'matched' | 'identified' | 'unknown'
-    confidence: number
   }>
   warnings: string[]
   meta: Record<string, unknown>
@@ -653,7 +636,6 @@ async function detectWithRoboflow(
     confidence: number
     matched_reference: boolean
     notes: string | null
-    bbox: [number, number, number, number] // normalized [x, y, w, h]
   }> = []
   let idMeta: Record<string, unknown> = {}
 
@@ -721,11 +703,6 @@ async function detectWithRoboflow(
     for (let i = 0; i < crops.length; i++) {
       const r = results[i]
       const pred = crops[i].pred
-      // Normalized bbox [x, y, w, h] in [0,1] coords relative to shelf image.
-      const nx = Math.max(0, (pred.x - pred.width / 2) / W)
-      const ny = Math.max(0, (pred.y - pred.height / 2) / H)
-      const nw = Math.min(1 - nx, pred.width / W)
-      const nh = Math.min(1 - ny, pred.height / H)
       if (r) {
         identifiedCount++
         if (r.matched_reference) refMatchCount++
@@ -735,7 +712,6 @@ async function detectWithRoboflow(
           confidence: Math.min(pred.confidence ?? 0.7, r.confidence),
           matched_reference: r.matched_reference,
           notes: r.notes,
-          bbox: [nx, ny, nw, nh],
         })
       } else {
         // OpenAI identification failed — keep the bottle but label as "Unknown bottle"
@@ -745,7 +721,6 @@ async function detectWithRoboflow(
           confidence: pred.confidence ?? 0.5,
           matched_reference: false,
           notes: null,
-          bbox: [nx, ny, nw, nh],
         })
       }
     }
@@ -756,26 +731,17 @@ async function detectWithRoboflow(
     }
   } else {
     // Multi-class model — trust Roboflow classes as-is.
-    // Need shelf image dims for normalized bboxes. Roboflow echoes them in
-    // data.image, fall back to 1 to avoid NaN if missing.
-    const W = Number(data?.image?.width) || 1
-    const H = Number(data?.image?.height) || 1
     for (const p of preds) {
       const raw = String(p.class ?? '').trim()
       if (!raw) continue
       const key = raw.toLowerCase()
       const pretty = classNameMap.get(key) ?? raw
-      const nx = Math.max(0, (p.x - p.width / 2) / W)
-      const ny = Math.max(0, (p.y - p.height / 2) / H)
-      const nw = Math.min(1 - nx, p.width / W)
-      const nh = Math.min(1 - ny, p.height / H)
       identifiedBottles.push({
         product: pretty,
         fill_level: 1,
         confidence: p.confidence ?? 0.7,
         matched_reference: classNameMap.has(key),
         notes: null,
-        bbox: [nx, ny, nw, nh],
       })
     }
   }
@@ -822,24 +788,8 @@ async function detectWithRoboflow(
       : x.notes,
   }))
 
-  // Per-bottle annotations for UI overlay — color coding:
-  //   matched = matched a reference gallery image (most confident)
-  //   identified = labeled but not from reference (model guessed off label text)
-  //   unknown = identification failed / "Unknown bottle"
-  const annotations = identifiedBottles.map((b) => ({
-    bbox: b.bbox,
-    product: b.product,
-    status: (b.product.toLowerCase().startsWith('unknown')
-      ? 'unknown'
-      : b.matched_reference
-        ? 'matched'
-        : 'identified') as 'matched' | 'identified' | 'unknown',
-    confidence: Math.round(b.confidence * 100) / 100,
-  }))
-
   return {
     detections,
-    annotations,
     warnings: preds.length === 0 ? ['roboflow returned no detections'] : [],
     meta: {
       backend: singleClass ? 'roboflow+openai-id' : 'roboflow',
@@ -957,18 +907,6 @@ Deno.serve(async (req) => {
     per_tile: tiles.map((t, i) => ({ id: t.id, bottles: perTile[i].length })),
   }
 
-  // Per-bottle annotations for UI overlay (same shape as Roboflow path).
-  const annotations = deduped.map((b) => ({
-    bbox: [b.gx, b.gy, b.gw, b.gh] as [number, number, number, number],
-    product: b.product,
-    status: (b.product.toLowerCase().startsWith('unknown')
-      ? 'unknown'
-      : b.matched_reference
-        ? 'matched'
-        : 'identified') as 'matched' | 'identified' | 'unknown',
-    confidence: Math.round((b.confidence ?? 0.5) * 100) / 100,
-  }))
-
   // Keep response shape backward compatible (detections[] + warnings[])
-  return json({ detections, annotations, warnings: [], meta })
+  return json({ detections, warnings: [], meta })
 })

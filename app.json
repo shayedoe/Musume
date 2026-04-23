@@ -3,10 +3,11 @@
     "name": "Musume",
     "slug": "musume",
     "scheme": "musume",
-    "version": "1.1.0",
+    "version": "1.1.1",
     "orientation": "portrait",
     "userInterfaceStyle": "dark",
     "backgroundColor": "#0b0b0c",
+    "icon": "./assets/musume-logo.png",
     "plugins": [
       "expo-router",
       "expo-image-picker"
@@ -22,11 +23,19 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.shayedoe.musume",
+      "icon": "./assets/musume-logo.png",
       "infoPlist": {
         "NSCameraUsageDescription": "Use the camera to capture inventory shelf photos.",
         "NSPhotoLibraryUsageDescription": "Use the photo library to upload inventory shelf photos.",
         "NSPhotoLibraryAddUsageDescription": "Save exported inventory files when needed.",
         "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "package": "com.shayedoe.musume",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/musume-logo.png",
+        "backgroundColor": "#000000"
       }
     },
     "extra": {

@@ -22,6 +22,7 @@ export interface Product {
   aliases?: string[] | null
   marginedge_product_id?: string | null
   active?: boolean | null
+  unit_price?: number | null
 }
 
 export type FillLevel = 1 | 0.5 | 0.1 | 0

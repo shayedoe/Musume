@@ -34,7 +34,7 @@ async function toJpeg(uri: string): Promise<{ uri: string; base64: string }> {
 
 export default function Camera() {
   const router = useRouter()
-  const { mode } = useLocalSearchParams<{ mode?: string }>()
+  const { mode, session_id } = useLocalSearchParams<{ mode?: string; session_id?: string }>()
   const initialMode: 'camera' | 'library' = mode === 'library' ? 'library' : 'camera'
 
   const [shots, setShots] = useState<LocalShot[]>([])
@@ -105,14 +105,18 @@ export default function Camera() {
     }
     setBusy(true)
     try {
-      setStatus('Creating session...')
-      const { data: sessionData, error: sessionError } = await (supabase as any)
-        .from('inventory_sessions')
-        .insert({} as any)
-        .select()
-        .single()
-      if (sessionError) throw sessionError
-      const sessionId = (sessionData as any).id as string
+      // Reuse session from Home, or fall back to creating one.
+      let sessionId = session_id
+      if (!sessionId) {
+        setStatus('Creating session...')
+        const { data: sessionData, error: sessionError } = await (supabase as any)
+          .from('inventory_sessions')
+          .insert({} as any)
+          .select()
+          .single()
+        if (sessionError) throw sessionError
+        sessionId = (sessionData as any).id as string
+      }
 
       setStatus('Analyzing...')
       const catalogHint = catalog.map((c) => c.name)
@@ -137,7 +141,6 @@ export default function Camera() {
       })
 
       setStatus('Uploading photos...')
-      const photoIds: string[] = []
       for (let i = 0; i < shots.length; i++) {
         const shot = shots[i]
         const response = await fetch(`data:image/jpeg;base64,${shot.base64}`)
@@ -150,58 +153,43 @@ export default function Camera() {
         const { data: urlData } = supabase.storage
           .from('inventory-images')
           .getPublicUrl(fileName)
-        const { data: photoData, error: photoError } = await (supabase as any)
+        // Insert with annotations; retry without if the column doesn't exist yet.
+        const { error: photoError } = await (supabase as any)
           .from('photos')
           .insert({
             session_id: sessionId,
             image_url: (urlData as any).publicUrl,
-            // annotations may be ignored if the column doesn't exist yet;
-            // it's written as JSONB so old DBs without the column will
-            // simply drop it (Postgres will error — handled below).
             annotations: perPhotoAnnotations[i] ?? [],
           } as any)
-          .select()
-          .single()
         if (photoError) {
-          // Backward compat: if the `annotations` column doesn't exist yet,
-          // retry without it so existing deployments keep working.
-          const { data: retryData, error: retryErr } = await (supabase as any)
+          const { error: retryErr } = await (supabase as any)
             .from('photos')
             .insert({
               session_id: sessionId,
               image_url: (urlData as any).publicUrl,
             } as any)
-            .select()
-            .single()
           if (retryErr) throw retryErr
-          photoIds.push((retryData as any).id)
-        } else {
-          photoIds.push((photoData as any).id)
         }
       }
 
       setStatus('Saving...')
-      // Merge across photos so duplicates from overlapping shots (or
-      // repeated products across shelves) become a single row with a
-      // summed count — instead of one row per photo per product.
-      // Snap to catalog canonical so "Don Julio 1942" and
-      // "Don Julio 1942 Tequila (750ml)" collapse into a single entry.
+      // Canonicalize via catalog so model name variants collapse.
       const canonicalize = (raw: string): string => {
         const m = matchProduct(raw, catalog)
         return m?.name ?? raw
       }
       const merged = mergeDetections(perPhotoDetections, canonicalize)
+      // Full-only mode: we don't track partial fills yet, so every
+      // detection row is saved with fill_level=1.
       const detectionRows: any[] = merged.map((d) => {
         const match = matchProduct(d.product, catalog)
         return {
-          // photo_id intentionally null on merged rows — the detection
-          // represents an aggregate across multiple photos in the session.
           photo_id: null,
           session_id: sessionId,
           predicted_product: d.product,
           matched_product_id: match?.id ?? null,
           count: d.count,
-          fill_level: d.fill_level,
+          fill_level: 1,
           confidence: d.confidence ?? null,
           notes: d.notes ?? null,
           status: 'pending',
