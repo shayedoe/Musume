@@ -80,7 +80,7 @@ export default function Camera() {
       setStatus('Creating session...')
       const { data: sessionData, error: sessionError } = await (supabase as any)
         .from('inventory_sessions')
-        .insert({ status: 'open' } as any)
+        .insert({} as any)
         .select()
         .single()
       if (sessionError) throw sessionError
