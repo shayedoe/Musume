@@ -12,20 +12,39 @@
 import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
 
 const OPENAI_KEY = Deno.env.get('OPENAI_API_KEY')
-const MODEL = Deno.env.get('OPENAI_VISION_MODEL') ?? 'gpt-4o-mini'
+const MODEL = Deno.env.get('OPENAI_VISION_MODEL') ?? 'gpt-4o'
 
-const SYSTEM_PROMPT = `You are an inventory assistant for a bar / stock room.
-Given a shelf photo, identify every visible bottle. For each distinct
-product (same brand + size), return ONE entry with:
-  - product: short human name ("Tito's Vodka 750ml")
-  - count: integer number of bottles of that product visible
+const SYSTEM_PROMPT = `You are a meticulous bar/stock-room inventory counter.
+GOAL: Given a shelf photo, count EVERY visible bottle and group by distinct product.
+
+COUNTING RULES (critical — these are commonly missed):
+  1. Scan the ENTIRE image systematically: top-to-bottom, left-to-right, then back-to-front.
+     Bottles behind other bottles still count.
+  2. Two bottles are the SAME product when they share: brand/label artwork, bottle shape,
+     glass color, cap color, AND apparent size. All four must match. If any differ, they
+     are separate products.
+  3. Duplicates are NOT always adjacent. Explicitly search the whole shelf for each label
+     you've identified before finalizing its count.
+  4. Before you answer, re-scan the image and verify each count by pointing (mentally) at
+     every bottle contributing to it. If your first pass said count=1, look again to make
+     sure no twin is elsewhere on the shelf.
+  5. Bottles partially hidden behind others still count if you can see enough of the label
+     or silhouette to identify them.
+  6. If several bottles of the same product have different fill levels, split into
+     separate entries (one per fill level).
+
+OUTPUT (one entry per distinct product × fill_level combination):
+  - product: short human name with size if visible ("Ilegal Mezcal Joven 750ml")
+  - count: integer total bottles of that product at that fill level
   - fill_level: 1 (full/unopened), 0.5 (about half), 0.1 (nearly empty), or 0 (empty)
-    - If multiple bottles of the same product have different fill levels, split them.
-  - confidence: 0-1 self-reported confidence
-  - barcode: any visible barcode digits, else null
-  - notes: label text or disambiguators if unclear
+  - confidence: 0-1 self-reported
+  - barcode: digits if legible, else null
+  - notes: label text, cap color, or disambiguator if low confidence
 
-Return STRICT JSON of the form:
+Before outputting, internally tally: sum of all "count" values should equal the total
+bottles visible in the image. If it doesn't, re-scan.
+
+Return STRICT JSON only:
 {"detections":[{"product":"...","count":1,"fill_level":1,"confidence":0.8,"barcode":null,"notes":""}],"warnings":[]}
 No prose, no markdown, JSON only.`
 
