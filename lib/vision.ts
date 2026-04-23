@@ -1,4 +1,5 @@
 import Constants from 'expo-constants'
+import { supabase } from './supabase'
 import type {
   FillLevel,
   VisionAnalysisResponse,
@@ -22,6 +23,39 @@ import type {
  */
 
 const FILL_BUCKETS: FillLevel[] = [1, 0.5, 0.1, 0]
+
+export interface BottleReference {
+  id: string
+  product_name: string
+  image_url: string
+  priority?: number | null
+  notes?: string | null
+}
+
+/**
+ * Fetch reference bottle photos from the `bottle_references` table, ordered
+ * by priority (lower = more important). Returned images are cross-referenced
+ * by the vision model to improve naming + duplicate counting.
+ * Non-fatal: returns [] on any failure.
+ */
+export async function fetchBottleReferences(limit = 25): Promise<BottleReference[]> {
+  try {
+    const { data, error } = await supabase
+      .from('bottle_references' as any)
+      .select('id, product_name, image_url, priority, notes')
+      .order('priority', { ascending: true })
+      .order('product_name', { ascending: true })
+      .limit(limit)
+    if (error) {
+      console.warn('[vision] fetchBottleReferences failed:', error.message)
+      return []
+    }
+    return (data ?? []) as BottleReference[]
+  } catch (e) {
+    console.warn('[vision] fetchBottleReferences threw:', e)
+    return []
+  }
+}
 
 const SYSTEM_PROMPT = `You are a meticulous bar/stock-room inventory counter.
 GOAL: Given a shelf photo, count EVERY visible bottle and group by distinct product.
@@ -100,7 +134,8 @@ function parseJsonBlock(text: string): any {
 async function callVisionEndpoint(
   endpoint: string,
   imageBase64: string,
-  catalogHint: string[]
+  catalogHint: string[],
+  references: BottleReference[]
 ): Promise<any> {
   const extra: any = Constants.expoConfig?.extra ?? {}
   const anonKey: string | undefined = extra.supabaseAnonKey
@@ -113,7 +148,11 @@ async function callVisionEndpoint(
   const res = await fetch(endpoint, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ image_base64: imageBase64, catalog: catalogHint }),
+    body: JSON.stringify({
+      image_base64: imageBase64,
+      catalog: catalogHint,
+      references: references.map((r) => ({ product: r.product_name, image_url: r.image_url })),
+    }),
   })
   if (!res.ok) {
     const body = await res.text().catch(() => '')
@@ -172,9 +211,12 @@ export async function analyzeShelfImage(
   const visionEndpoint: string | undefined = extra.visionEndpoint
   const openaiKey: string | undefined = extra.openaiApiKey
 
+  // Pull reference images (capped server-side to 25). Failures are non-fatal.
+  const references = await fetchBottleReferences(25)
+
   let raw: any
   if (visionEndpoint) {
-    raw = await callVisionEndpoint(visionEndpoint, imageBase64, catalogHint)
+    raw = await callVisionEndpoint(visionEndpoint, imageBase64, catalogHint, references)
   } else if (openaiKey) {
     raw = await callOpenAIVision(openaiKey, imageBase64, catalogHint)
   } else {

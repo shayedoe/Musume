@@ -24,6 +24,13 @@ export default function Home() {
       >
         <Text style={{ color: '#fff', fontSize: 18, fontWeight: '600' }}>Start Session – Upload Photo</Text>
       </Pressable>
+
+      <Pressable
+        onPress={() => router.push('/references')}
+        style={{ padding: 14, backgroundColor: '#8E8E93', borderRadius: 10, width: 260, alignItems: 'center', marginTop: 12 }}
+      >
+        <Text style={{ color: '#fff', fontSize: 15, fontWeight: '600' }}>Manage Bottle References</Text>
+      </Pressable>
     </View>
   )
 }
