@@ -44,7 +44,7 @@ const SELF_VERIFY_DEFAULT = (Deno.env.get('VISION_SELF_VERIFY') ?? '0') === '1'
 // Set via:  supabase secrets set ROBOFLOW_MODEL=musume/1
 const ROBOFLOW_MODEL = Deno.env.get('ROBOFLOW_MODEL')
 const ROBOFLOW_API_KEY = Deno.env.get('ROBOFLOW_API_KEY')
-const ROBOFLOW_CONFIDENCE = parseFloat(Deno.env.get('ROBOFLOW_CONFIDENCE') ?? '0.4')
+const ROBOFLOW_CONFIDENCE = parseFloat(Deno.env.get('ROBOFLOW_CONFIDENCE') ?? '0.9')
 const ROBOFLOW_OVERLAP = parseFloat(Deno.env.get('ROBOFLOW_OVERLAP') ?? '0.3')
 const TILE_OVERLAP = 0.1 // 10% overlap so bottles on seams still get counted in at least one tile
 
