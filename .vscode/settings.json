@@ -1,0 +1,8 @@
+{
+  "deno.enable": false,
+  "deno.enablePaths": ["./supabase/functions"],
+  "typescript.tsserver.experimental.useVsCodeWatcher": true,
+  "files.associations": {
+    "supabase/Inventory.htm": "html"
+  }
+}
