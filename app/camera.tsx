@@ -16,7 +16,7 @@ import { supabase } from '../lib/supabase'
 import { analyzeShelfImage, mergeDetections } from '../lib/vision'
 import { ensureCatalogSeeded, matchProduct } from '../lib/catalog'
 import { theme } from '../lib/theme'
-import type { Product, VisionDetectionResult } from '../lib/types'
+import type { BottleAnnotation, Product, VisionAnalysisResponse, VisionDetectionResult } from '../lib/types'
 
 interface LocalShot {
   uri: string
@@ -121,14 +121,18 @@ export default function Camera() {
       )
 
       const perPhotoDetections: VisionDetectionResult[][] = []
+      const perPhotoAnnotations: BottleAnnotation[][] = []
       const warnings: string[] = []
       analyses.forEach((r, i) => {
         if (r.status === 'fulfilled') {
-          perPhotoDetections.push(r.value.detections)
-          if (r.value.warnings?.length) warnings.push(...r.value.warnings)
+          const v = r.value as VisionAnalysisResponse
+          perPhotoDetections.push(v.detections)
+          perPhotoAnnotations.push(v.annotations ?? [])
+          if (v.warnings?.length) warnings.push(...v.warnings)
         } else {
           warnings.push(`Photo ${i + 1}: ${r.reason?.message ?? 'analysis failed'}`)
           perPhotoDetections.push([])
+          perPhotoAnnotations.push([])
         }
       })
 
@@ -148,18 +152,45 @@ export default function Camera() {
           .getPublicUrl(fileName)
         const { data: photoData, error: photoError } = await (supabase as any)
           .from('photos')
-          .insert({ session_id: sessionId, image_url: (urlData as any).publicUrl } as any)
+          .insert({
+            session_id: sessionId,
+            image_url: (urlData as any).publicUrl,
+            // annotations may be ignored if the column doesn't exist yet;
+            // it's written as JSONB so old DBs without the column will
+            // simply drop it (Postgres will error — handled below).
+            annotations: perPhotoAnnotations[i] ?? [],
+          } as any)
           .select()
           .single()
-        if (photoError) throw photoError
-        photoIds.push((photoData as any).id)
+        if (photoError) {
+          // Backward compat: if the `annotations` column doesn't exist yet,
+          // retry without it so existing deployments keep working.
+          const { data: retryData, error: retryErr } = await (supabase as any)
+            .from('photos')
+            .insert({
+              session_id: sessionId,
+              image_url: (urlData as any).publicUrl,
+            } as any)
+            .select()
+            .single()
+          if (retryErr) throw retryErr
+          photoIds.push((retryData as any).id)
+        } else {
+          photoIds.push((photoData as any).id)
+        }
       }
 
       setStatus('Saving...')
       // Merge across photos so duplicates from overlapping shots (or
       // repeated products across shelves) become a single row with a
       // summed count — instead of one row per photo per product.
-      const merged = mergeDetections(perPhotoDetections)
+      // Snap to catalog canonical so "Don Julio 1942" and
+      // "Don Julio 1942 Tequila (750ml)" collapse into a single entry.
+      const canonicalize = (raw: string): string => {
+        const m = matchProduct(raw, catalog)
+        return m?.name ?? raw
+      }
+      const merged = mergeDetections(perPhotoDetections, canonicalize)
       const detectionRows: any[] = merged.map((d) => {
         const match = matchProduct(d.product, catalog)
         return {

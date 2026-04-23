@@ -15,7 +15,7 @@ import * as Sharing from 'expo-sharing'
 import { File, Paths } from 'expo-file-system'
 import { supabase } from '../lib/supabase'
 import { theme } from '../lib/theme'
-import type { FillLevel } from '../lib/types'
+import type { BottleAnnotation, FillLevel } from '../lib/types'
 
 interface ReviewRow {
   id: string
@@ -57,6 +57,7 @@ export default function Review() {
   const [loading, setLoading] = useState(true)
   const [exporting, setExporting] = useState(false)
   const [imageUrls, setImageUrls] = useState<string[]>([])
+  const [annotationsByUrl, setAnnotationsByUrl] = useState<Record<string, BottleAnnotation[]>>({})
   const [rows, setRows] = useState<ReviewRow[]>([])
 
   useEffect(() => {
@@ -68,9 +69,17 @@ export default function Review() {
     try {
       const { data: photoData } = await (supabase as any)
         .from('photos')
-        .select('image_url')
+        .select('image_url, annotations')
         .eq('session_id', session_id)
-      setImageUrls(((photoData as any[]) ?? []).map((p) => p.image_url))
+      const photos = ((photoData as any[]) ?? [])
+      setImageUrls(photos.map((p) => p.image_url))
+      const map: Record<string, BottleAnnotation[]> = {}
+      for (const p of photos) {
+        if (Array.isArray(p.annotations)) {
+          map[p.image_url] = p.annotations as BottleAnnotation[]
+        }
+      }
+      setAnnotationsByUrl(map)
 
       const { data: detData } = await (supabase as any)
         .from('detections')
@@ -200,26 +209,37 @@ export default function Review() {
         </View>
 
         {imageUrls.length > 0 && (
-          <ScrollView
-            horizontal
-            showsHorizontalScrollIndicator={false}
-            style={{ marginTop: 16 }}
-            contentContainerStyle={{ paddingHorizontal: 20, gap: 10 }}
-          >
-            {imageUrls.map((url) => (
-              <Image
-                key={url}
-                source={{ uri: url }}
+          <>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              style={{ marginTop: 16 }}
+              contentContainerStyle={{ paddingHorizontal: 20, gap: 12 }}
+            >
+              {imageUrls.map((url) => (
+                <AnnotatedPhoto
+                  key={url}
+                  url={url}
+                  annotations={annotationsByUrl[url] ?? []}
+                />
+              ))}
+            </ScrollView>
+            {Object.values(annotationsByUrl).some((a) => a.length > 0) && (
+              <View
                 style={{
-                  width: 120,
-                  height: 160,
-                  borderRadius: 10,
-                  backgroundColor: theme.surface,
+                  flexDirection: 'row',
+                  paddingHorizontal: 20,
+                  marginTop: 10,
+                  gap: 14,
+                  flexWrap: 'wrap',
                 }}
-                resizeMode="cover"
-              />
-            ))}
-          </ScrollView>
+              >
+                <LegendDot color="#22c55e" label="Matched reference" />
+                <LegendDot color="#eab308" label="Identified" />
+                <LegendDot color="#ef4444" label="Unknown" />
+              </View>
+            )}
+          </>
         )}
 
         {/* Compact table: product · count · fill · remove */}
@@ -482,6 +502,128 @@ export default function Review() {
           </Pressable>
         </View>
       </ScrollView>
+    </View>
+  )
+}
+
+// ---------- Annotated photo overlay ----------
+
+const STATUS_COLORS: Record<BottleAnnotation['status'], string> = {
+  matched: '#22c55e', // green
+  identified: '#eab308', // yellow
+  unknown: '#ef4444', // red
+}
+
+function AnnotatedPhoto({
+  url,
+  annotations,
+}: {
+  url: string
+  annotations: BottleAnnotation[]
+}) {
+  const [dims, setDims] = useState<{ w: number; h: number } | null>(null)
+  // Preview size — tall enough to see bottles clearly, still fits in horizontal strip.
+  const W = 220
+  const H = 300
+
+  return (
+    <View
+      style={{
+        width: W,
+        height: H,
+        borderRadius: 10,
+        backgroundColor: theme.surface,
+        overflow: 'hidden',
+        position: 'relative',
+      }}
+    >
+      <Image
+        source={{ uri: url }}
+        style={{ width: W, height: H }}
+        resizeMode="cover"
+        onLoad={(e) => {
+          const src = e.nativeEvent?.source
+          if (src && typeof src.width === 'number' && typeof src.height === 'number') {
+            setDims({ w: src.width, h: src.height })
+          }
+        }}
+      />
+      {annotations.length > 0 &&
+        annotations.map((a, i) => {
+          // bbox is normalized [0,1] relative to the ORIGINAL image.
+          // With resizeMode="cover", the image is scaled so min dim fills
+          // and the other dim is cropped. Compute the visible rect.
+          let scaleX = 1, scaleY = 1, offsetX = 0, offsetY = 0
+          if (dims) {
+            const scale = Math.max(W / dims.w, H / dims.h)
+            const displayW = dims.w * scale
+            const displayH = dims.h * scale
+            offsetX = (W - displayW) / 2
+            offsetY = (H - displayH) / 2
+            scaleX = displayW
+            scaleY = displayH
+          } else {
+            // Fallback: assume no crop (1:1 mapping)
+            scaleX = W
+            scaleY = H
+          }
+          const [bx, by, bw, bh] = a.bbox
+          const left = offsetX + bx * scaleX
+          const top = offsetY + by * scaleY
+          const width = bw * scaleX
+          const height = bh * scaleY
+          const color = STATUS_COLORS[a.status] ?? STATUS_COLORS.unknown
+          return (
+            <View
+              key={i}
+              pointerEvents="none"
+              style={{
+                position: 'absolute',
+                left,
+                top,
+                width,
+                height,
+                borderColor: color,
+                borderWidth: 1.5,
+                borderRadius: 2,
+              }}
+            />
+          )
+        })}
+      {annotations.length > 0 && (
+        <View
+          style={{
+            position: 'absolute',
+            right: 4,
+            top: 4,
+            backgroundColor: 'rgba(0,0,0,0.6)',
+            paddingHorizontal: 6,
+            paddingVertical: 2,
+            borderRadius: 4,
+          }}
+        >
+          <Text style={{ color: '#fff', fontSize: 10, fontWeight: '600' }}>
+            {annotations.length} {annotations.length === 1 ? 'bottle' : 'bottles'}
+          </Text>
+        </View>
+      )}
+    </View>
+  )
+}
+
+function LegendDot({ color, label }: { color: string; label: string }) {
+  return (
+    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+      <View
+        style={{
+          width: 10,
+          height: 10,
+          borderRadius: 2,
+          borderWidth: 1.5,
+          borderColor: color,
+        }}
+      />
+      <Text style={{ color: theme.textMuted, fontSize: 11 }}>{label}</Text>
     </View>
   )
 }

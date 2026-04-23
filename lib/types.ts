@@ -57,8 +57,16 @@ export interface VisionDetectionResult {
   barcode?: string | null
 }
 
+export interface BottleAnnotation {
+  bbox: [number, number, number, number] // normalized [x, y, w, h] in [0,1]
+  product: string
+  status: 'matched' | 'identified' | 'unknown'
+  confidence: number
+}
+
 export interface VisionAnalysisResponse {
   detections: VisionDetectionResult[]
+  annotations?: BottleAnnotation[]
   warnings?: string[]
 }
 

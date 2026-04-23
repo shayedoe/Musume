@@ -230,8 +230,29 @@ export async function analyzeShelfImage(
     .map(normalizeDetection)
     .filter((d): d is VisionDetectionResult => d !== null)
 
+  // Per-bottle annotations with bboxes (for UI overlay). Validate shape.
+  const rawAnnotations: any[] = Array.isArray(raw?.annotations) ? raw.annotations : []
+  const annotations = rawAnnotations
+    .map((a: any) => {
+      const bbox = a?.bbox
+      if (!Array.isArray(bbox) || bbox.length !== 4) return null
+      const [x, y, w, h] = bbox.map((n: any) => Number(n))
+      if (![x, y, w, h].every((n) => Number.isFinite(n))) return null
+      const status = a?.status === 'matched' || a?.status === 'identified' || a?.status === 'unknown'
+        ? a.status
+        : 'identified'
+      return {
+        bbox: [x, y, w, h] as [number, number, number, number],
+        product: String(a?.product ?? 'Unknown bottle'),
+        status,
+        confidence: Number(a?.confidence ?? 0.5),
+      }
+    })
+    .filter((a): a is NonNullable<typeof a> => a !== null)
+
   return {
     detections,
+    annotations,
     warnings: Array.isArray(raw?.warnings) ? raw.warnings.map(String) : [],
   }
 }
@@ -242,15 +263,22 @@ export async function analyzeShelfImage(
  * cover different shelf sections. If two photos of the same shelf
  * slightly overlap, a handful of bottles may double-count; the user
  * can edit the count on the review screen.
+ *
+ * If `canonicalize` is provided, the product name is snapped to the
+ * catalog canonical name before keying — so model-reported variants
+ * like "Don Julio 1942" and "Don Julio 1942 Tequila (750ml)" collapse
+ * into a single row.
  */
 export function mergeDetections(
-  groups: VisionDetectionResult[][]
+  groups: VisionDetectionResult[][],
+  canonicalize?: (raw: string) => string
 ): VisionDetectionResult[] {
   const bucket = new Map<string, VisionDetectionResult>()
   for (const group of groups) {
     for (const d of group) {
       // Normalize name so "Tito's Vodka" and "tito's vodka " collapse.
-      const normProduct = d.product.trim().replace(/\s+/g, ' ')
+      let normProduct = d.product.trim().replace(/\s+/g, ' ')
+      if (canonicalize) normProduct = canonicalize(normProduct)
       const key = `${normProduct.toLowerCase()}|${d.fill_level}`
       const existing = bucket.get(key)
       if (!existing) {
