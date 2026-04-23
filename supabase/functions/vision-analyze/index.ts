@@ -1,35 +1,3 @@
-// Supabase Edge Function: vision-analyze
-// Deploy: supabase functions deploy vision-analyze
-// Secrets: supabase secrets set OPENAI_API_KEY=sk-...
-//
-// Request:  POST {
-//   image_base64: string,
-//   catalog?: string[],
-//   references?: [{ product, image_url }],
-//   tile_grid?: "1x1" | "2x2" | "3x3",   // override per request
-//   skip_verify?: boolean
-// }
-// Response: { detections, warnings, meta }
-//
-// ACCURACY STRATEGY (2026-04, iteration 3)
-// ----------------------------------------------------------------
-// The big miss before was that a single vision call on a whole shelf
-// systematically collapses multiples ("I see Tito's" — count=1, done).
-// Commercial shelf-recognition systems (Trax, Planorama, Scandit) solve
-// this with REGION DETECTION: tile the shelf into smaller crops, run
-// detection per tile, aggregate. We do the same here.
-//
-// 1) TILING — decode the shelf JPEG server-side with ImageScript, slice
-//    into a grid (default 2x2 with ~10% overlap), and run an independent
-//    per-bottle enumeration on each tile + on the full frame.
-// 2) BOUNDING BOXES — every bottle the model returns must carry a
-//    normalized [x,y,w,h] bbox in tile-local coords. We translate back
-//    to global coords, then dedupe across tiles by IoU + product name.
-// 3) REFERENCE GALLERY — still inlined as base64 data URLs (past fix for
-//    OpenAI's "failed to download" errors on Supabase storage).
-// 4) NO MORE SELF-VERIFY BY DEFAULT — tiling does that job better.
-// ----------------------------------------------------------------
-
 // deno-lint-ignore-file no-explicit-any
 import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
 import { decode, Image } from 'https://deno.land/x/imagescript@1.2.17/mod.ts'
@@ -44,7 +12,7 @@ const SELF_VERIFY_DEFAULT = (Deno.env.get('VISION_SELF_VERIFY') ?? '0') === '1'
 // Set via:  supabase secrets set ROBOFLOW_MODEL=musume/1
 const ROBOFLOW_MODEL = Deno.env.get('ROBOFLOW_MODEL')
 const ROBOFLOW_API_KEY = Deno.env.get('ROBOFLOW_API_KEY')
-const ROBOFLOW_CONFIDENCE = parseFloat(Deno.env.get('ROBOFLOW_CONFIDENCE') ?? '0.9')
+const ROBOFLOW_CONFIDENCE = parseFloat(Deno.env.get('ROBOFLOW_CONFIDENCE') ?? '0.75')
 const ROBOFLOW_OVERLAP = parseFloat(Deno.env.get('ROBOFLOW_OVERLAP') ?? '0.3')
 const TILE_OVERLAP = 0.1 // 10% overlap so bottles on seams still get counted in at least one tile
 
@@ -483,13 +451,6 @@ function parseGrid(value: string | undefined): { cols: number; rows: number } {
   return { cols, rows }
 }
 
-// ---------------- Roboflow hosted detection path ----------------
-// When ROBOFLOW_MODEL is set we prefer a trained custom detector over
-// the OpenAI tiled pipeline. Roboflow returns bounding boxes with class
-// labels + per-box confidence; we aggregate by class name. If the class
-// name matches an entry in the `bottle_references` or catalog, we use
-// that pretty name; otherwise we fall back to the raw class string.
-
 interface RoboflowPrediction {
   x: number
   y: number
@@ -500,18 +461,6 @@ interface RoboflowPrediction {
   class_id?: number
 }
 
-/**
- * Hybrid Roboflow + OpenAI pipeline.
- *   1. Roboflow detects every bottle's bbox (detection only — no SKU).
- *   2. For each bbox, crop the original shelf image to just that bottle.
- *   3. Send the crop + the reference gallery to OpenAI in one call per
- *      bottle, asking "which reference is this?" — batched in parallel,
- *      limited to BOTTLE_ID_CONCURRENCY at a time to stay under rate limits.
- *   4. Aggregate by returned product name.
- *
- * If the Roboflow class is richer than just "bottle" (e.g. per-SKU classes),
- * the class name is preferred over OpenAI identification.
- */
 const BOTTLE_ID_CONCURRENCY = 6
 const BOTTLE_CROP_PADDING = 0.05 // expand each bbox by 5% so labels aren't clipped
 

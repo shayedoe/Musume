@@ -30,7 +30,7 @@
         "NSPhotoLibraryAddUsageDescription": "Save exported inventory files when needed.",
         "ITSAppUsesNonExemptEncryption": false
       },
-      "buildNumber": "2"
+      "buildNumber": "3"
     },
     "android": {
       "package": "com.shayedoe.musume",
