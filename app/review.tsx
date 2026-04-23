@@ -650,8 +650,28 @@ function AnnotatedPhoto({
   annotations: BottleAnnotation[]
 }) {
   const [dims, setDims] = useState<{ w: number; h: number } | null>(null)
+  const [showOverlay, setShowOverlay] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const W = 300
   const H = 400
+
+  // Eagerly fetch the image dimensions so the overlay aligns even if
+  // <Image onLoad> doesn't surface them on this platform.
+  useEffect(() => {
+    let cancelled = false
+    Image.getSize(
+      url,
+      (w, h) => {
+        if (!cancelled) setDims({ w, h })
+      },
+      (err) => {
+        if (!cancelled) setLoadError(String((err as any)?.message ?? err ?? 'load failed'))
+      }
+    )
+    return () => {
+      cancelled = true
+    }
+  }, [url])
 
   // Compute the visible rect of the image. We use `contain` so the full
   // photo is always visible (no cropping), then letterbox the remainder.
@@ -687,59 +707,83 @@ function AnnotatedPhoto({
             setDims({ w: src.width, h: src.height })
           }
         }}
+        onError={(e) =>
+          setLoadError(String(e?.nativeEvent?.error ?? 'image failed to load'))
+        }
       />
-      {annotations.map((a, i) => {
-        const [bx, by, bw, bh] = a.bbox
-        const left = offsetX + bx * scaleX
-        const top = offsetY + by * scaleY
-        const width = bw * scaleX
-        const height = bh * scaleY
-        const color = STATUS_COLORS[a.status] ?? STATUS_COLORS.unknown
-        // Filled translucent bottle-shaped mask: a rounded neck on top
-        // plus a body with the status color. We approximate the bottle
-        // silhouette by stacking two rounded rects (neck ~25% of height,
-        // ~35% of width centered; body fills the rest).
-        const neckH = Math.max(6, height * 0.22)
-        const neckW = Math.max(4, width * 0.38)
-        const neckX = left + (width - neckW) / 2
-        const bodyTop = top + neckH * 0.75
-        const bodyH = height - neckH * 0.75
-        return (
-          <View key={i} pointerEvents="none">
-            {/* Neck */}
-            <View
-              style={{
-                position: 'absolute',
-                left: neckX,
-                top,
-                width: neckW,
-                height: neckH,
-                backgroundColor: color,
-                opacity: 0.45,
-                borderTopLeftRadius: 3,
-                borderTopRightRadius: 3,
-                borderWidth: 1,
-                borderColor: color,
-              }}
-            />
-            {/* Body */}
-            <View
-              style={{
-                position: 'absolute',
-                left,
-                top: bodyTop,
-                width,
-                height: bodyH,
-                backgroundColor: color,
-                opacity: 0.35,
-                borderRadius: Math.min(width, bodyH) * 0.18,
-                borderWidth: 1.5,
-                borderColor: color,
-              }}
-            />
-          </View>
-        )
-      })}
+      {showOverlay &&
+        annotations.map((a, i) => {
+          const [bx, by, bw, bh] = a.bbox
+          const left = offsetX + bx * scaleX
+          const top = offsetY + by * scaleY
+          const width = bw * scaleX
+          const height = bh * scaleY
+          const color = STATUS_COLORS[a.status] ?? STATUS_COLORS.unknown
+          // Filled translucent bottle-shaped mask: a rounded neck on top
+          // plus a body. Opacity is intentionally low so the underlying
+          // photo stays visible even when many bottles overlap.
+          const neckH = Math.max(6, height * 0.22)
+          const neckW = Math.max(4, width * 0.38)
+          const neckX = left + (width - neckW) / 2
+          const bodyTop = top + neckH * 0.75
+          const bodyH = height - neckH * 0.75
+          return (
+            <View key={i} pointerEvents="none">
+              {/* Neck */}
+              <View
+                style={{
+                  position: 'absolute',
+                  left: neckX,
+                  top,
+                  width: neckW,
+                  height: neckH,
+                  backgroundColor: color,
+                  opacity: 0.18,
+                  borderTopLeftRadius: 3,
+                  borderTopRightRadius: 3,
+                  borderWidth: 1,
+                  borderColor: color,
+                }}
+              />
+              {/* Body */}
+              <View
+                style={{
+                  position: 'absolute',
+                  left,
+                  top: bodyTop,
+                  width,
+                  height: bodyH,
+                  backgroundColor: color,
+                  opacity: 0.18,
+                  borderRadius: Math.min(width, bodyH) * 0.18,
+                  borderWidth: 1.5,
+                  borderColor: color,
+                }}
+              />
+            </View>
+          )
+        })}
+      {/* Tap to toggle overlay so you can confirm the photo loaded. */}
+      <Pressable
+        onPress={() => setShowOverlay((v) => !v)}
+        style={{ position: 'absolute', left: 0, top: 0, right: 0, bottom: 0 }}
+      />
+      {loadError && (
+        <View
+          style={{
+            position: 'absolute',
+            left: 0,
+            right: 0,
+            bottom: 0,
+            backgroundColor: 'rgba(0,0,0,0.75)',
+            padding: 6,
+          }}
+        >
+          <Text style={{ color: '#fca5a5', fontSize: 10 }} numberOfLines={2}>
+            {loadError}
+          </Text>
+        </View>
+      )}
       {annotations.length > 0 && (
         <View
           style={{
@@ -753,7 +797,7 @@ function AnnotatedPhoto({
           }}
         >
           <Text style={{ color: '#fff', fontSize: 10, fontWeight: '600' }}>
-            {annotations.length} {annotations.length === 1 ? 'bottle' : 'bottles'}
+            {showOverlay ? `${annotations.length} ${annotations.length === 1 ? 'bottle' : 'bottles'}` : 'tap to show'}
           </Text>
         </View>
       )}
