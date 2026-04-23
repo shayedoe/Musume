@@ -10,6 +10,7 @@ import {
   TextInput,
   FlatList,
 } from 'react-native'
+import Constants from 'expo-constants'
 import { useRouter } from 'expo-router'
 import * as ImagePicker from 'expo-image-picker'
 import * as ImageManipulator from 'expo-image-manipulator'
@@ -43,6 +44,8 @@ export default function References() {
   const [search, setSearch] = useState('')
   const [busy, setBusy] = useState(false)
   const [uploadingFor, setUploadingFor] = useState<string | null>(null)
+  const [autoSeeding, setAutoSeeding] = useState(false)
+  const [autoSeedStatus, setAutoSeedStatus] = useState<string>('')
 
   const load = async () => {
     try {
@@ -143,6 +146,50 @@ export default function References() {
     }
   }
 
+  const autoSeedBatch = async (limit: number) => {
+    try {
+      const extra: any = Constants.expoConfig?.extra ?? {}
+      const visionEndpoint: string | undefined = extra.visionEndpoint
+      if (!visionEndpoint) throw new Error('Vision endpoint not configured')
+      const seedEndpoint = visionEndpoint.replace(/\/vision-analyze\/?$/, '/seed-references')
+      const anonKey: string | undefined = extra.supabaseAnonKey
+
+      const existing = new Set(refs.map((r) => r.product_name))
+      const bottles = catalog.filter((p) => /bottle/i.test(p.count_unit ?? ''))
+      const targets = bottles.filter((p) => !existing.has(p.name)).slice(0, limit)
+      if (!targets.length) {
+        Alert.alert('Nothing to seed', 'Every bottle already has a reference image.')
+        return
+      }
+
+      setAutoSeeding(true)
+      setAutoSeedStatus(`Searching for ${targets.length} bottles... (can take 1–3 min)`)
+
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+      if (anonKey) {
+        headers['Authorization'] = `Bearer ${anonKey}`
+        headers['apikey'] = anonKey
+      }
+      const res = await fetch(seedEndpoint, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ products: targets.map((p) => p.name), skip_existing: true }),
+      })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(body?.error || `status ${res.status}`)
+
+      const ok = body?.summary?.ok ?? 0
+      const failed = body?.summary?.failed ?? 0
+      setAutoSeedStatus(`Seeded ${ok} of ${targets.length}. ${failed} failed.`)
+      await load()
+    } catch (e: any) {
+      Alert.alert('Auto-seed failed', String(e?.message ?? e))
+      setAutoSeedStatus('')
+    } finally {
+      setAutoSeeding(false)
+    }
+  }
+
   const deleteReference = async (r: BottleReferenceRow) => {
     Alert.alert('Delete reference?', r.product_name, [
       { text: 'Cancel', style: 'cancel' },
@@ -182,6 +229,36 @@ export default function References() {
         Add a photo of each bottle you stock. The AI uses these images to match + count bottles
         in shelf photos more accurately. First 25 (lowest priority number) are sent per analysis.
       </Text>
+
+      <View style={{ paddingHorizontal: 16, marginBottom: 8 }}>
+        <Pressable
+          disabled={autoSeeding}
+          onPress={() => autoSeedBatch(50)}
+          style={{
+            padding: 12,
+            backgroundColor: autoSeeding ? '#aaa' : '#AF52DE',
+            borderRadius: 8,
+            alignItems: 'center',
+          }}
+        >
+          {autoSeeding ? (
+            <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+              <ActivityIndicator color="#fff" style={{ marginRight: 8 }} />
+              <Text style={{ color: '#fff', fontWeight: '600' }}>Auto-seeding...</Text>
+            </View>
+          ) : (
+            <Text style={{ color: '#fff', fontWeight: '600' }}>
+              🔍 Auto-seed next 50 bottles from web
+            </Text>
+          )}
+        </Pressable>
+        {!!autoSeedStatus && (
+          <Text style={{ fontSize: 12, color: '#666', marginTop: 6, textAlign: 'center' }}>
+            {autoSeedStatus}
+          </Text>
+        )}
+      </View>
+
       <View style={{ paddingHorizontal: 16, marginBottom: 8 }}>
         <TextInput
           value={search}
