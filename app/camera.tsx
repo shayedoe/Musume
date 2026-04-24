@@ -13,7 +13,7 @@ import { useRouter, useLocalSearchParams } from 'expo-router'
 import * as ImagePicker from 'expo-image-picker'
 import * as ImageManipulator from 'expo-image-manipulator'
 import { supabase } from '../lib/supabase'
-import { analyzeShelfImage, mergeDetections } from '../lib/vision'
+import { analyzeShelfImage, mergeDetections, mergeMaxPerProduct } from '../lib/vision'
 import { ensureCatalogSeeded, matchProduct } from '../lib/catalog'
 import { theme } from '../lib/theme'
 import type { BottleAnnotation, Product, VisionAnalysisResponse, VisionDetectionResult } from '../lib/types'
@@ -21,6 +21,19 @@ import type { BottleAnnotation, Product, VisionAnalysisResponse, VisionDetection
 interface LocalShot {
   uri: string
   base64: string
+}
+
+type Angle = 'left' | 'front' | 'right'
+const ANGLE_ORDER: Angle[] = ['left', 'front', 'right']
+const ANGLE_LABEL: Record<Angle, string> = {
+  left: 'Left side',
+  front: 'Front',
+  right: 'Right side',
+}
+const ANGLE_HINT: Record<Angle, string> = {
+  left: 'Stand to the left of the bundle so you can see labels on the left-facing bottles.',
+  front: 'Stand directly in front of the bundle. Include the whole group in frame.',
+  right: 'Step around to the right side. Capture any labels that were hidden in the other two shots.',
 }
 
 async function toJpeg(uri: string): Promise<{ uri: string; base64: string }> {
@@ -60,12 +73,17 @@ function base64ToUint8Array(b64: string): Uint8Array {
   return bytes
 }
 
+type CaptureMode = 'single' | 'bundle' | 'library'
+
 export default function Camera() {
   const router = useRouter()
   const { mode, session_id } = useLocalSearchParams<{ mode?: string; session_id?: string }>()
-  const initialMode: 'camera' | 'library' = mode === 'library' ? 'library' : 'camera'
+  const initialMode: CaptureMode = mode === 'library' ? 'library' : 'single'
 
+  const [captureMode, setCaptureMode] = useState<CaptureMode>(initialMode)
   const [shots, setShots] = useState<LocalShot[]>([])
+  // Bundle (multi-angle) shots, keyed by angle so the user can retake one.
+  const [bundle, setBundle] = useState<Partial<Record<Angle, LocalShot>>>({})
   const [busy, setBusy] = useState(false)
   const [status, setStatus] = useState<string>('')
   const [catalog, setCatalog] = useState<Product[]>([])
@@ -126,8 +144,52 @@ export default function Camera() {
     setShots((prev) => prev.filter((_, i) => i !== idx))
   }
 
+  const captureAngle = async (angle: Angle) => {
+    const { status: perm } = await ImagePicker.requestCameraPermissionsAsync()
+    if (perm !== 'granted') {
+      Alert.alert('Permission needed', 'Camera permission is required.')
+      return
+    }
+    const result = await ImagePicker.launchCameraAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      allowsEditing: false,
+      quality: 0.7,
+      base64: false,
+    })
+    if (!result.canceled && result.assets[0]) {
+      const jpeg = await toJpeg(result.assets[0].uri)
+      if (jpeg.base64) setBundle((prev) => ({ ...prev, [angle]: jpeg }))
+    }
+  }
+
+  const clearBundleAngle = (angle: Angle) => {
+    setBundle((prev) => {
+      const next = { ...prev }
+      delete next[angle]
+      return next
+    })
+  }
+
   const analyzeAndUpload = async () => {
-    if (shots.length === 0) {
+    // Assemble the photo list + merge strategy based on capture mode.
+    // - single / library: keep legacy SUM merge (each photo may show a
+    //   different section of the bar, so counts should add).
+    // - bundle:            MAX-per-product merge across the 3 angles, since
+    //                      each angle shows the same physical bottles.
+    const isBundle = captureMode === 'bundle'
+    const orderedBundle: LocalShot[] = isBundle
+      ? (ANGLE_ORDER.map((a) => bundle[a]).filter(Boolean) as LocalShot[])
+      : []
+    const photosToUpload: LocalShot[] = isBundle ? orderedBundle : shots
+
+    if (isBundle && orderedBundle.length < 3) {
+      Alert.alert(
+        'Need all 3 angles',
+        'Please capture Left, Front, and Right shots of the bundle.'
+      )
+      return
+    }
+    if (!isBundle && shots.length === 0) {
       Alert.alert('No photos', 'Add at least one photo.')
       return
     }
@@ -161,10 +223,10 @@ export default function Camera() {
         sessionId = (sessionData as any).id as string
       }
 
-      setStatus('Analyzing...')
+      setStatus(isBundle ? 'Analyzing 3 angles...' : 'Analyzing...')
       const catalogHint = catalog.map((c) => c.name)
       const analyses = await Promise.allSettled(
-        shots.map((s) => analyzeShelfImage(s.base64, catalogHint))
+        photosToUpload.map((s) => analyzeShelfImage(s.base64, catalogHint))
       )
 
       const perPhotoDetections: VisionDetectionResult[][] = []
@@ -184,8 +246,8 @@ export default function Camera() {
       })
 
       setStatus('Uploading photos...')
-      for (let i = 0; i < shots.length; i++) {
-        const shot = shots[i]
+      for (let i = 0; i < photosToUpload.length; i++) {
+        const shot = photosToUpload[i]
         // React Native's fetch('data:...').blob() produces a 0-byte blob on
         // iOS, which silently uploads a broken file. Decode the base64 to a
         // Uint8Array and upload the raw bytes instead.
@@ -223,7 +285,9 @@ export default function Camera() {
         const m = matchProduct(raw, catalog)
         return m?.name ?? raw
       }
-      const merged = mergeDetections(perPhotoDetections, canonicalize)
+      const merged = isBundle
+        ? mergeMaxPerProduct(perPhotoDetections, canonicalize)
+        : mergeDetections(perPhotoDetections, canonicalize)
       // Full-only mode: we don't track partial fills yet, so every
       // detection row is saved with fill_level=1.
       const detectionRows: any[] = merged.map((d) => {
@@ -284,15 +348,137 @@ export default function Camera() {
           Capture
         </Text>
 
-        <View style={{ flexDirection: 'row', gap: 10, marginBottom: 18 }}>
-          <ToolbarButton label="Camera" onPress={addFromCamera} active={initialMode === 'camera'} />
-          <ToolbarButton label="Upload" onPress={addFromLibrary} active={initialMode === 'library'} />
+        <View style={{ flexDirection: 'row', gap: 8, marginBottom: 18 }}>
+          <ToolbarButton
+            label="Photo"
+            onPress={() => setCaptureMode('single')}
+            active={captureMode === 'single'}
+          />
+          <ToolbarButton
+            label="Bundle"
+            onPress={() => setCaptureMode('bundle')}
+            active={captureMode === 'bundle'}
+          />
+          <ToolbarButton
+            label="Upload"
+            onPress={() => setCaptureMode('library')}
+            active={captureMode === 'library'}
+          />
         </View>
+
+        {captureMode === 'bundle' && (
+          <Text
+            style={{
+              color: theme.textMuted,
+              fontSize: 12,
+              lineHeight: 17,
+              marginBottom: 14,
+            }}
+          >
+            Capture the same bundle from 3 angles so labels hidden in one view
+            can be read from another. We keep the MAX count per product across
+            angles — no double-counting.
+          </Text>
+        )}
+
+        {captureMode === 'single' && (
+          <View style={{ flexDirection: 'row', gap: 10, marginBottom: 14 }}>
+            <ToolbarButton label="Take photo" onPress={addFromCamera} />
+          </View>
+        )}
+
+        {captureMode === 'library' && (
+          <View style={{ flexDirection: 'row', gap: 10, marginBottom: 14 }}>
+            <ToolbarButton label="Choose photos" onPress={addFromLibrary} />
+          </View>
+        )}
+
+        {captureMode === 'bundle' && (
+          <View style={{ gap: 10, marginBottom: 18 }}>
+            {ANGLE_ORDER.map((angle) => {
+              const shot = bundle[angle]
+              return (
+                <View
+                  key={angle}
+                  style={{
+                    flexDirection: 'row',
+                    backgroundColor: theme.surface,
+                    borderRadius: 12,
+                    padding: 10,
+                    borderWidth: 1,
+                    borderColor: shot ? theme.border : '#3a3a40',
+                    alignItems: 'center',
+                    gap: 12,
+                  }}
+                >
+                  <View
+                    style={{
+                      width: 64,
+                      height: 84,
+                      borderRadius: 8,
+                      backgroundColor: theme.surfaceAlt,
+                      overflow: 'hidden',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                    }}
+                  >
+                    {shot ? (
+                      <Image source={{ uri: shot.uri }} style={{ width: 64, height: 84 }} />
+                    ) : (
+                      <Text style={{ color: theme.textFaint, fontSize: 11 }}>empty</Text>
+                    )}
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text
+                      style={{ color: theme.text, fontSize: 14, fontWeight: '700' }}
+                    >
+                      {ANGLE_LABEL[angle]}
+                    </Text>
+                    <Text
+                      style={{
+                        color: theme.textMuted,
+                        fontSize: 11,
+                        marginTop: 2,
+                        lineHeight: 15,
+                      }}
+                    >
+                      {ANGLE_HINT[angle]}
+                    </Text>
+                  </View>
+                  <Pressable
+                    onPress={() => (shot ? clearBundleAngle(angle) : captureAngle(angle))}
+                    style={({ pressed }) => ({
+                      paddingVertical: 8,
+                      paddingHorizontal: 12,
+                      borderRadius: 8,
+                      backgroundColor: pressed
+                        ? '#2a2a2f'
+                        : shot
+                          ? theme.surfaceAlt
+                          : theme.accent,
+                    })}
+                  >
+                    <Text
+                      style={{
+                        color: shot ? theme.text : theme.accentText,
+                        fontSize: 12,
+                        fontWeight: '700',
+                      }}
+                    >
+                      {shot ? 'Retake' : 'Capture'}
+                    </Text>
+                  </Pressable>
+                </View>
+              )
+            })}
+          </View>
+        )}
 
         {!!status && !busy && (
           <Text style={{ color: theme.textMuted, fontSize: 13, marginBottom: 12 }}>{status}</Text>
         )}
 
+        {captureMode !== 'bundle' && (
         <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginBottom: 22 }}>
           {shots.map((s, idx) => (
             <View key={idx} style={{ position: 'relative' }}>
@@ -329,8 +515,11 @@ export default function Camera() {
             </Text>
           )}
         </View>
+        )}
 
-        {shots.length > 0 && (
+        {(captureMode === 'bundle'
+          ? Object.keys(bundle).length === 3
+          : shots.length > 0) && (
           <Pressable
             onPress={analyzeAndUpload}
             disabled={busy}
@@ -350,7 +539,9 @@ export default function Camera() {
               </View>
             ) : (
               <Text style={{ color: theme.accentText, fontSize: 16, fontWeight: '700', letterSpacing: 0.3 }}>
-                Analyze {shots.length} photo{shots.length > 1 ? 's' : ''}
+                {captureMode === 'bundle'
+                  ? 'Analyze 3-angle bundle'
+                  : `Analyze ${shots.length} photo${shots.length > 1 ? 's' : ''}`}
               </Text>
             )}
           </Pressable>

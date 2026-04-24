@@ -355,14 +355,37 @@ function iou(a: GlobalBottle, b: GlobalBottle): number {
   return ua > 0 ? inter / ua : 0
 }
 
+// Generic words that must NOT cause two different SKUs to be considered the
+// same product during dedupe. Without this, "Nikka Coffey Vodka" and
+// "Townes Vodka" share the token "vodka" and get collapsed when their
+// bboxes overlap (front-row vs back-row bottle), producing wildly wrong
+// counts where one class dominates.
+const GENERIC_PRODUCT_TOKENS = new Set([
+  'vodka', 'tequila', 'mezcal', 'gin', 'rum', 'whiskey', 'whisky', 'bourbon',
+  'scotch', 'cognac', 'brandy', 'liqueur', 'wine', 'champagne', 'beer',
+  'reserve', 'reserva', 'extra', 'special', 'premium', 'organic', 'silver',
+  'blanco', 'reposado', 'anejo', 'gold', 'black', 'white', 'red',
+  'handmade', 'craft', 'distilled', 'spirit', 'spirits', 'bottle',
+  '750ml', '1000ml', '1l', '750', '1l', 'ml',
+])
+
 function productsMatch(a: string, b: string): boolean {
   const na = a.toLowerCase().trim()
   const nb = b.toLowerCase().trim()
+  if (!na || !nb) return false
   if (na === nb) return true
-  // generous match: shared 4+ char token
-  const ta = new Set(na.split(/[^a-z0-9]+/).filter((s) => s.length >= 4))
-  for (const t of nb.split(/[^a-z0-9]+/)) {
-    if (t.length >= 4 && ta.has(t)) return true
+  // "Unknown bottle" should never collapse with anything else.
+  if (na.includes('unknown') || nb.includes('unknown')) return false
+  // Strict match: must share a *non-generic* token of length >= 4.
+  // "Nikka" / "Townes" / "Belvedere" / "Tito" pass; "vodka" / "premium" don't.
+  const tokens = (s: string) =>
+    s
+      .split(/[^a-z0-9]+/)
+      .filter((t) => t.length >= 4 && !GENERIC_PRODUCT_TOKENS.has(t))
+  const ta = new Set(tokens(na))
+  if (ta.size === 0) return false
+  for (const t of tokens(nb)) {
+    if (ta.has(t)) return true
   }
   return false
 }
@@ -373,7 +396,10 @@ function dedupe(bottles: GlobalBottle[]): GlobalBottle[] {
   for (const b of bottles) {
     let merged = false
     for (const k of kept) {
-      if (iou(b, k) > 0.35 && productsMatch(b.product, k.product)) {
+      // Require substantial overlap before treating as the same physical
+      // bottle. Front-row bottles often partially occlude back-row ones
+      // (~30% IoU); we don't want those collapsed into one count.
+      if (iou(b, k) > 0.55 && productsMatch(b.product, k.product)) {
         // keep the higher-confidence / reference-matched one's product name
         if (!k.matched_reference && b.matched_reference) {
           k.product = b.product
@@ -464,27 +490,45 @@ interface RoboflowPrediction {
 const BOTTLE_ID_CONCURRENCY = 6
 const BOTTLE_CROP_PADDING = 0.05 // expand each bbox by 5% so labels aren't clipped
 
-const SKU_ID_PROMPT = `You identify a single bottle in a close-up crop.
+const SKU_ID_PROMPT = `You identify a SINGLE bottle in a close-up crop.
 
-You will be given:
-  - A CROP of one bottle from a bar shelf.
+INPUTS
+  - One CROP showing one bottle from a bar shelf.
   - A REFERENCE GALLERY of known products, each labeled with a product name.
 
-TASK
-  1. Which reference bottle in the gallery best matches the crop? Match on
-     label artwork, bottle shape, glass color, cap color, and apparent size.
-  2. If NONE of the references match, describe the bottle using whatever
-     label text you can read.
-  3. Estimate the fill level: 1 (full/unopened), 0.5 (about half),
-     0.1 (nearly empty), 0 (empty).
+IDENTIFICATION PROCEDURE (follow in this exact order)
+  Step 1 — READ THE LABEL TEXT FIRST.
+    Read every legible word/letter on the bottle label and cap. Do this
+    BEFORE comparing to references. Example tokens you might read:
+    "NIKKA", "COFFEY", "TOWNES", "BELVEDERE", "TITO'S", "OSHE",
+    "GREY GOOSE", "GOODNIGHT LOVING", "HANGAR 1", etc.
+    If you can read a brand name, that brand WINS over visual similarity.
+  Step 2 — Match to a REFERENCE only if the brand text on the crop is
+    consistent with the reference. Two bottles can look similar (clear
+    glass, dark cap, similar height) and still be DIFFERENT products.
+    Never pick a reference whose brand name contradicts text you can read.
+  Step 3 — If the label is unreadable AND no reference is a clear visual
+    match (label artwork + bottle silhouette + cap + glass color all
+    consistent), return product = "Unknown bottle" with low confidence.
+    DO NOT guess the most common class on the shelf.
+
+CONFIDENCE
+  - 0.85+  : you can read brand text and it matches a reference.
+  - 0.6-0.85 : strong visual match to a reference, partial label visible.
+  - <0.5   : you are guessing — in this case product MUST be
+             "Unknown bottle".
+
+FILL LEVEL
+  1 (full/unopened), 0.5 (about half), 0.1 (nearly empty), 0 (empty).
 
 OUTPUT — STRICT JSON only, no prose:
 {
-  "product": "Ilegal Mezcal Joven 750ml",
+  "product": "Nikka Coffey Vodka" OR "Unknown bottle",
   "matched_reference": true,
+  "label_text": "NIKKA COFFEY VODKA",
   "fill_level": 1,
   "confidence": 0.9,
-  "notes": "black cap, green glass"
+  "notes": "black cap, blue label band"
 }`
 
 async function identifyBottleCrop(
@@ -525,13 +569,33 @@ async function identifyBottleCrop(
     ])
     const product = String(raw?.product ?? '').trim()
     if (!product) return { ok: false, reason: 'empty product from model' }
+    const confidence =
+      typeof raw?.confidence === 'number' ? raw.confidence : 0.7
+    // If the model is unsure, demote to "Unknown bottle" rather than
+    // letting a low-confidence guess get aggregated as a real SKU. This
+    // is the main safeguard against one class (e.g. Nikka) dominating a
+    // crowded shelf where many bottles share visual traits.
+    const LOW_CONF_FLOOR = 0.5
+    const finalProduct =
+      product.toLowerCase() === 'unknown bottle' || confidence < LOW_CONF_FLOOR
+        ? 'Unknown bottle'
+        : product
+    const matched_reference =
+      finalProduct === 'Unknown bottle' ? false : !!raw?.matched_reference
+    const labelText = raw?.label_text ? String(raw.label_text).slice(0, 80) : ''
+    const baseNotes = raw?.notes ? String(raw.notes) : null
+    const notes = labelText
+      ? baseNotes
+        ? `${baseNotes} · label: ${labelText}`
+        : `label: ${labelText}`
+      : baseNotes
     return {
       ok: true,
-      product,
-      matched_reference: !!raw?.matched_reference,
+      product: finalProduct,
+      matched_reference,
       fill_level: snapFill(raw?.fill_level ?? 1),
-      confidence: typeof raw?.confidence === 'number' ? raw.confidence : 0.7,
-      notes: raw?.notes ? String(raw.notes) : null,
+      confidence,
+      notes,
     }
   } catch (e: any) {
     return { ok: false, reason: String(e?.message ?? e).slice(0, 200) }

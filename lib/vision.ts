@@ -264,6 +264,10 @@ export async function analyzeShelfImage(
  * name is snapped to the catalog canonical name before keying so
  * variants like "Don Julio 1942" and "Don Julio 1942 Tequila (750ml)"
  * collapse into a single row.
+ *
+ * Use this when each photo covers a DIFFERENT section (library upload
+ * of multiple shelves). For multi-angle shots of the SAME bundle, use
+ * `mergeMaxPerProduct` instead to avoid multiplying the count.
  */
 export function mergeDetections(
   groups: VisionDetectionResult[][],
@@ -280,6 +284,63 @@ export function mergeDetections(
         bucket.set(key, { ...d, product: normProduct })
       } else {
         existing.count += d.count
+        if ((d.confidence ?? 0) > (existing.confidence ?? 0)) {
+          existing.confidence = d.confidence
+        }
+        if (!existing.barcode && d.barcode) existing.barcode = d.barcode
+      }
+    }
+  }
+  return Array.from(bucket.values())
+}
+
+/**
+ * Merge detections across multiple photos of the SAME bundle taken from
+ * different angles (e.g. left / front / right).
+ *
+ * Each angle is assumed to contain the same physical bottles; some labels
+ * may only be legible from one angle. We therefore:
+ *   - Take the MAX count per product across angles (not the sum).
+ *   - Take the union of products, so a bottle only identifiable from the
+ *     right shot still appears in the final list.
+ *   - Within a single angle, detections with the same canonical product +
+ *     fill_level are first summed (the model already outputs per-product
+ *     rows; this just handles stray duplicates within one response).
+ */
+export function mergeMaxPerProduct(
+  groups: VisionDetectionResult[][],
+  canonicalize?: (raw: string) => string
+): VisionDetectionResult[] {
+  const canon = (raw: string): string => {
+    const p = raw.trim().replace(/\s+/g, ' ')
+    return canonicalize ? canonicalize(p) : p
+  }
+  const keyOf = (product: string, fill: FillLevel) =>
+    `${product.toLowerCase()}|${fill}`
+
+  const bucket = new Map<string, VisionDetectionResult>()
+  for (const group of groups) {
+    // collapse within-angle duplicates by SUM (same bottle shouldn't appear
+    // twice in one response, but the model sometimes splits).
+    const local = new Map<string, VisionDetectionResult>()
+    for (const d of group) {
+      const p = canon(d.product)
+      const k = keyOf(p, d.fill_level)
+      const ex = local.get(k)
+      if (!ex) local.set(k, { ...d, product: p })
+      else {
+        ex.count += d.count
+        if ((d.confidence ?? 0) > (ex.confidence ?? 0)) ex.confidence = d.confidence
+        if (!ex.barcode && d.barcode) ex.barcode = d.barcode
+      }
+    }
+    // cross-angle: MAX count wins, keep best confidence, union of barcodes.
+    for (const [k, d] of local) {
+      const existing = bucket.get(k)
+      if (!existing) {
+        bucket.set(k, { ...d })
+      } else {
+        if (d.count > existing.count) existing.count = d.count
         if ((d.confidence ?? 0) > (existing.confidence ?? 0)) {
           existing.confidence = d.confidence
         }
