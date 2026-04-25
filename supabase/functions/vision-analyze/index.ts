@@ -355,6 +355,134 @@ function iou(a: GlobalBottle, b: GlobalBottle): number {
   return ua > 0 ? inter / ua : 0
 }
 
+function centerX(b: GlobalBottle): number {
+  return b.gx + b.gw / 2
+}
+
+function bottomY(b: GlobalBottle): number {
+  return b.gy + b.gh
+}
+
+function bboxArea(b: GlobalBottle): number {
+  return b.gw * b.gh
+}
+
+function clampBottle(b: GlobalBottle): GlobalBottle | null {
+  const gx = Math.max(0, Math.min(1, b.gx))
+  const gy = Math.max(0, Math.min(1, b.gy))
+  const gw = Math.max(0, Math.min(1 - gx, b.gw))
+  const gh = Math.max(0, Math.min(1 - gy, b.gh))
+  if (![gx, gy, gw, gh].every((n) => Number.isFinite(n))) return null
+  if (gw <= 0 || gh <= 0) return null
+  return { ...b, gx, gy, gw, gh }
+}
+
+function isBottleLikeBox(b: GlobalBottle): boolean {
+  const aspect = b.gh / Math.max(b.gw, 0.0001)
+  const area = bboxArea(b)
+  if ((b.confidence ?? 0) < 0.35) return false
+  if (b.gw < 0.018 || b.gh < 0.12) return false
+  if (b.gw > 0.32 || b.gh > 0.92) return false
+  if (area < 0.004 || area > 0.22) return false
+  if (aspect < 1.25 || aspect > 9.5) return false
+  // Boxes floating on the wall above the bottles are usually label/edge
+  // hallucinations. A bottle candidate should extend into the shelf region.
+  if (bottomY(b) < 0.42) return false
+  return true
+}
+
+function bottleScore(b: GlobalBottle): number {
+  const aspect = b.gh / Math.max(b.gw, 0.0001)
+  const aspectScore = 1 - Math.min(1, Math.abs(aspect - 3.5) / 5)
+  const heightScore = Math.min(1, b.gh / 0.5)
+  const referenceScore = b.matched_reference ? 0.15 : 0
+  return (b.confidence ?? 0.5) + aspectScore * 0.2 + heightScore * 0.15 + referenceScore
+}
+
+function mergeBottleBoxes(a: GlobalBottle, b: GlobalBottle): GlobalBottle {
+  const winner = bottleScore(b) > bottleScore(a) ? b : a
+  const x1 = Math.min(a.gx, b.gx)
+  const y1 = Math.min(a.gy, b.gy)
+  const x2 = Math.max(a.gx + a.gw, b.gx + b.gw)
+  const y2 = Math.max(a.gy + a.gh, b.gy + b.gh)
+  return {
+    ...winner,
+    gx: x1,
+    gy: y1,
+    gw: Math.max(0, Math.min(1 - x1, x2 - x1)),
+    gh: Math.max(0, Math.min(1 - y1, y2 - y1)),
+    confidence: Math.max(a.confidence ?? 0, b.confidence ?? 0),
+    matched_reference: a.matched_reference || b.matched_reference,
+    barcode: a.barcode ?? b.barcode,
+    notes: winner.notes ?? a.notes ?? b.notes,
+    source_tile: `${a.source_tile}+${b.source_tile}`,
+  }
+}
+
+function shouldMergeColumnFragment(a: GlobalBottle, b: GlobalBottle): boolean {
+  const xDelta = Math.abs(centerX(a) - centerX(b))
+  const xLimit = Math.max(0.028, Math.min(a.gw, b.gw) * 0.85)
+  if (xDelta > xLimit) return false
+  const verticalGap = Math.max(a.gy, b.gy) - Math.min(bottomY(a), bottomY(b))
+  const verticallyTouching = verticalGap <= 0.04
+  const oneLooksFragment =
+    a.gh < 0.26 || b.gh < 0.26 || bboxArea(a) < 0.018 || bboxArea(b) < 0.018
+  return verticallyTouching && oneLooksFragment
+}
+
+function mergeColumnFragments(bottles: GlobalBottle[]): GlobalBottle[] {
+  let current = [...bottles].sort((a, b) => centerX(a) - centerX(b) || a.gy - b.gy)
+  let changed = true
+  while (changed) {
+    changed = false
+    const next: GlobalBottle[] = []
+    const used = new Set<number>()
+    for (let i = 0; i < current.length; i++) {
+      if (used.has(i)) continue
+      let merged = current[i]
+      for (let j = i + 1; j < current.length; j++) {
+        if (used.has(j)) continue
+        if (shouldMergeColumnFragment(merged, current[j])) {
+          merged = mergeBottleBoxes(merged, current[j])
+          used.add(j)
+          changed = true
+        }
+      }
+      next.push(merged)
+    }
+    current = next
+  }
+  return current
+}
+
+function nmsBottles(bottles: GlobalBottle[], threshold = 0.45): GlobalBottle[] {
+  const candidates = [...bottles].sort((a, b) => bottleScore(b) - bottleScore(a))
+  const kept: GlobalBottle[] = []
+  for (const candidate of candidates) {
+    let merged = false
+    for (let i = 0; i < kept.length; i++) {
+      const overlap = iou(candidate, kept[i])
+      const sameColumn = Math.abs(centerX(candidate) - centerX(kept[i])) < 0.025
+      if (overlap > threshold || (overlap > 0.25 && sameColumn)) {
+        kept[i] = mergeBottleBoxes(kept[i], candidate)
+        merged = true
+        break
+      }
+    }
+    if (!merged) kept.push(candidate)
+  }
+  return kept.sort((a, b) => a.gx - b.gx || a.gy - b.gy)
+}
+
+function postProcessBottles(bottles: GlobalBottle[]): GlobalBottle[] {
+  const geometryFiltered = bottles
+    .map(clampBottle)
+    .filter((b): b is GlobalBottle => b !== null)
+    .filter(isBottleLikeBox)
+  const mergedFragments = mergeColumnFragments(geometryFiltered)
+  return nmsBottles(mergedFragments)
+}
+
 // Generic words that must NOT cause two different SKUs to be considered the
 // same product during dedupe. Without this, "Nikka Coffey Vodka" and
 // "Townes Vodka" share the token "vodka" and get collapsed when their
@@ -808,56 +936,9 @@ async function detectWithRoboflow(
     }
   }
 
-  // Aggregate by (product, fill_level)
-  const bucket = new Map<string, {
-    product: string
-    count: number
-    fill_level: number
-    confSum: number
-    matched_reference: boolean
-    notes: string | null
-  }>()
-  for (const b of identifiedBottles) {
-    const key = `${b.product.toLowerCase()}|${b.fill_level}`
-    const existing = bucket.get(key)
-    if (!existing) {
-      bucket.set(key, {
-        product: b.product,
-        count: 1,
-        fill_level: b.fill_level,
-        confSum: b.confidence,
-        matched_reference: b.matched_reference,
-        notes: b.notes,
-      })
-    } else {
-      existing.count += 1
-      existing.confSum += b.confidence
-      if (b.matched_reference) existing.matched_reference = true
-      if (!existing.notes && b.notes) existing.notes = b.notes
-    }
-  }
-
-  const detections = Array.from(bucket.values()).map((x) => ({
-    product: x.product,
-    count: x.count,
-    fill_level: x.fill_level,
-    confidence: Math.round((x.confSum / x.count) * 100) / 100,
-    barcode: null as string | null,
-    notes: x.matched_reference
-      ? x.notes
-        ? `${x.notes} · matched reference`
-        : 'matched reference'
-      : x.notes,
-  }))
-
-  // Per-bottle annotations (normalized 0..1 bboxes) for UI overlay.
-  // Roboflow returns x,y as center coords + width/height, all in pixels.
-  const annotations: Array<{
-    bbox: [number, number, number, number]
-    product: string
-    status: 'matched' | 'identified' | 'unknown'
-    confidence: number
-  }> = []
+  // Convert Roboflow's center-pixel boxes into global normalized boxes,
+  // then run geometry-first post-processing before counts or UI overlays.
+  const rawGlobalBottles: GlobalBottle[] = []
   if (imgW > 0 && imgH > 0) {
     for (const b of identifiedBottles) {
       const p = b.pred
@@ -865,25 +946,24 @@ async function detectWithRoboflow(
       const ny = (p.y - p.height / 2) / imgH
       const nw = p.width / imgW
       const nh = p.height / imgH
-      const status: 'matched' | 'identified' | 'unknown' =
-        b.product === 'Unknown bottle'
-          ? 'unknown'
-          : b.matched_reference
-          ? 'matched'
-          : 'identified'
-      annotations.push({
-        bbox: [
-          Math.max(0, Math.min(1, nx)),
-          Math.max(0, Math.min(1, ny)),
-          Math.max(0, Math.min(1, nw)),
-          Math.max(0, Math.min(1, nh)),
-        ],
+      rawGlobalBottles.push({
         product: b.product,
-        status,
+        fill_level: b.fill_level,
         confidence: b.confidence,
+        matched_reference: b.matched_reference,
+        barcode: null,
+        notes: b.notes,
+        gx: nx,
+        gy: ny,
+        gw: nw,
+        gh: nh,
+        source_tile: 'roboflow',
       })
     }
   }
+  const postProcessedBottles = postProcessBottles(rawGlobalBottles)
+  const detections = aggregate(postProcessedBottles)
+  const annotations = annotationsFromBottles(postProcessedBottles)
 
   return {
     detections,
@@ -896,8 +976,10 @@ async function detectWithRoboflow(
       backend: singleClass ? 'roboflow+openai-id' : 'roboflow',
       model: ROBOFLOW_MODEL,
       raw_predictions: preds.length,
+      identified_bottles: identifiedBottles.length,
+      postprocessed_bottles: postProcessedBottles.length,
       single_class: singleClass,
-      unique_products: bucket.size,
+      unique_products: detections.length,
       reference_count: inlinedRefs.length,
       image: data?.image,
       time: data?.time,
@@ -995,12 +1077,14 @@ Deno.serve(async (req) => {
   )
   const allBottles: GlobalBottle[] = perTile.flat()
 
-  // Dedupe bottles that sit in overlap regions (appear in 2 adjacent tiles)
-  const beforeDedupe = allBottles.length
-  const deduped = dedupe(allBottles)
+  // Consolidate fragments/duplicates into one instance per bottle before
+  // counting or drawing review overlays.
+  const rawBottles = allBottles.length
+  const productDeduped = dedupe(allBottles)
+  const postProcessed = postProcessBottles(productDeduped)
 
-  const detections = aggregate(deduped)
-  const annotations = annotationsFromBottles(deduped)
+  const detections = aggregate(postProcessed)
+  const annotations = annotationsFromBottles(postProcessed)
 
   const meta = {
     backend: 'openai-tiled',
@@ -1008,8 +1092,9 @@ Deno.serve(async (req) => {
     grid: `${grid.cols}x${grid.rows}`,
     tiles: tiles.length,
     reference_count: inlinedRefs.length,
-    raw_bottles: beforeDedupe,
-    deduped_bottles: deduped.length,
+    raw_bottles: rawBottles,
+    product_deduped_bottles: productDeduped.length,
+    postprocessed_bottles: postProcessed.length,
     per_tile: tiles.map((t, i) => ({ id: t.id, bottles: perTile[i].length })),
   }
 
