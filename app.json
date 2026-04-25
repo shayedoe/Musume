@@ -25,7 +25,7 @@
       "bundleIdentifier": "com.shayedoe.musume",
       "icon": "./assets/musume-logo.png",
       "infoPlist": {
-        "NSCameraUsageDescription": "Use the camera to capture inventory shelf photos.",
+        "NSCameraUsageDescription": "Use the camera to capture and scan inventory shelf photos.",
         "NSPhotoLibraryUsageDescription": "Use the photo library to upload inventory shelf photos.",
         "NSPhotoLibraryAddUsageDescription": "Save exported inventory files when needed.",
         "ITSAppUsesNonExemptEncryption": false
@@ -34,6 +34,12 @@
     },
     "android": {
       "package": "com.shayedoe.musume",
+      "permissions": [
+        "android.permission.CAMERA"
+      ],
+      "blockedPermissions": [
+        "android.permission.RECORD_AUDIO"
+      ],
       "adaptiveIcon": {
         "foregroundImage": "./assets/musume-logo.png",
         "backgroundColor": "#000000"

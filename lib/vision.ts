@@ -255,6 +255,7 @@ export async function analyzeShelfImage(
     detections,
     annotations,
     warnings: Array.isArray(raw?.warnings) ? raw.warnings.map(String) : [],
+    meta: raw?.meta && typeof raw.meta === 'object' ? raw.meta : undefined,
   }
 }
 

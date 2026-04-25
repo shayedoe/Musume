@@ -241,6 +241,23 @@ export default function References() {
 
       <View style={{ paddingHorizontal: 20, marginTop: 14 }}>
         <Pressable
+          onPress={() => router.push('/train')}
+          style={({ pressed }) => ({
+            padding: 14,
+            backgroundColor: pressed ? '#26262a' : theme.surface,
+            borderRadius: 12,
+            alignItems: 'center',
+            borderWidth: 1,
+            borderColor: theme.border,
+            marginBottom: 10,
+          })}
+        >
+          <Text style={{ color: theme.text, fontWeight: '700', fontSize: 14 }}>
+            Analyze bottle
+          </Text>
+        </Pressable>
+
+        <Pressable
           disabled={autoSeeding}
           onPress={() => autoSeedBatch(50)}
           style={({ pressed }) => ({

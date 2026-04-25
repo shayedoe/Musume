@@ -170,6 +170,10 @@ export default function Camera() {
     })
   }
 
+  const startTrain = () => {
+    router.push('/train')
+  }
+
   const analyzeAndUpload = async () => {
     // Assemble the photo list + merge strategy based on capture mode.
     // - single / library: keep legacy SUM merge (each photo may show a
@@ -231,17 +235,24 @@ export default function Camera() {
 
       const perPhotoDetections: VisionDetectionResult[][] = []
       const perPhotoAnnotations: BottleAnnotation[][] = []
+      const perPhotoWarnings: string[][] = []
+      const perPhotoMeta: Array<Record<string, unknown> | undefined> = []
       const warnings: string[] = []
       analyses.forEach((r, i) => {
         if (r.status === 'fulfilled') {
           const v = r.value as VisionAnalysisResponse
           perPhotoDetections.push(v.detections)
           perPhotoAnnotations.push(v.annotations ?? [])
+          perPhotoWarnings.push(v.warnings ?? [])
+          perPhotoMeta.push(v.meta)
           if (v.warnings?.length) warnings.push(...v.warnings)
         } else {
-          warnings.push(`Photo ${i + 1}: ${r.reason?.message ?? 'analysis failed'}`)
+          const warning = `Photo ${i + 1}: ${r.reason?.message ?? 'analysis failed'}`
+          warnings.push(warning)
           perPhotoDetections.push([])
           perPhotoAnnotations.push([])
+          perPhotoWarnings.push([warning])
+          perPhotoMeta.push(undefined)
         }
       })
 
@@ -260,12 +271,13 @@ export default function Camera() {
         const { data: urlData } = supabase.storage
           .from('inventory-images')
           .getPublicUrl(fileName)
+        const imageUrl = (urlData as any).publicUrl
         // Insert with annotations; retry without if the column doesn't exist yet.
         const { error: photoError } = await (supabase as any)
           .from('photos')
           .insert({
             session_id: sessionId,
-            image_url: (urlData as any).publicUrl,
+            image_url: imageUrl,
             annotations: perPhotoAnnotations[i] ?? [],
           } as any)
         if (photoError) {
@@ -273,10 +285,23 @@ export default function Camera() {
             .from('photos')
             .insert({
               session_id: sessionId,
-              image_url: (urlData as any).publicUrl,
+              image_url: imageUrl,
             } as any)
           if (retryErr) throw retryErr
         }
+        const { error: debugError } = await (supabase as any)
+          .from('vision_debug_logs')
+          .insert({
+            session_id: sessionId,
+            image_url: imageUrl,
+            photo_index: i,
+            capture_mode: captureMode,
+            detections: perPhotoDetections[i] ?? [],
+            annotations: perPhotoAnnotations[i] ?? [],
+            warnings: perPhotoWarnings[i] ?? [],
+            meta: perPhotoMeta[i] ?? {},
+          } as any)
+        if (debugError) console.warn('[camera.vision_debug_logs]', debugError.message)
       }
 
       setStatus('Saving...')
@@ -364,6 +389,7 @@ export default function Camera() {
             onPress={() => setCaptureMode('library')}
             active={captureMode === 'library'}
           />
+          <ToolbarButton label="Train" onPress={startTrain} />
         </View>
 
         {captureMode === 'bundle' && (

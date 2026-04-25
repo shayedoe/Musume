@@ -69,6 +69,7 @@ export interface VisionAnalysisResponse {
   detections: VisionDetectionResult[]
   annotations?: BottleAnnotation[]
   warnings?: string[]
+  meta?: Record<string, unknown>
 }
 
 export interface Database {

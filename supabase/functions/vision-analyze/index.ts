@@ -468,6 +468,28 @@ function aggregate(bottles: GlobalBottle[]) {
   }))
 }
 
+function annotationsFromBottles(bottles: GlobalBottle[]) {
+  return bottles.map((b) => {
+    const status: 'matched' | 'identified' | 'unknown' =
+      b.product.toLowerCase().includes('unknown')
+        ? 'unknown'
+        : b.matched_reference
+          ? 'matched'
+          : 'identified'
+    return {
+      bbox: [
+        Math.max(0, Math.min(1, b.gx)),
+        Math.max(0, Math.min(1, b.gy)),
+        Math.max(0, Math.min(1, b.gw)),
+        Math.max(0, Math.min(1, b.gh)),
+      ] as [number, number, number, number],
+      product: b.product,
+      status,
+      confidence: b.confidence,
+    }
+  })
+}
+
 function parseGrid(value: string | undefined): { cols: number; rows: number } {
   const v = (value ?? DEFAULT_GRID ?? '2x2').toLowerCase()
   const m = v.match(/^(\d)x(\d)$/)
@@ -905,6 +927,8 @@ Deno.serve(async (req) => {
   if (!image || typeof image !== 'string') return json({ error: 'image_base64 required' }, 400)
   if (image.length > 14_000_000) return json({ error: 'image too large' }, 413)
 
+  let roboflowWarning: string | null = null
+
   // ---- Roboflow path (preferred when model is configured) ----
   if (ROBOFLOW_MODEL && ROBOFLOW_API_KEY) {
     // Build a class-slug -> pretty-product-name map from the request's
@@ -931,6 +955,7 @@ Deno.serve(async (req) => {
     } catch (e: any) {
       // If Roboflow fails, fall through to the OpenAI path so the user
       // still gets a result rather than a hard error.
+      roboflowWarning = `roboflow failed, fell back to openai: ${String(e).slice(0, 240)}`
       console.warn('[vision-analyze] roboflow failed, falling back to openai:', String(e))
     }
   }
@@ -975,8 +1000,10 @@ Deno.serve(async (req) => {
   const deduped = dedupe(allBottles)
 
   const detections = aggregate(deduped)
+  const annotations = annotationsFromBottles(deduped)
 
   const meta = {
+    backend: 'openai-tiled',
     model: MODEL,
     grid: `${grid.cols}x${grid.rows}`,
     tiles: tiles.length,
@@ -987,5 +1014,5 @@ Deno.serve(async (req) => {
   }
 
   // Keep response shape backward compatible (detections[] + warnings[])
-  return json({ detections, warnings: [], meta })
+  return json({ detections, annotations, warnings: roboflowWarning ? [roboflowWarning] : [], meta })
 })

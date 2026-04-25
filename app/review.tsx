@@ -9,13 +9,15 @@ import {
   Image,
   ActivityIndicator,
   StatusBar,
+  Modal,
 } from 'react-native'
 import { useRouter, useLocalSearchParams } from 'expo-router'
 import * as Sharing from 'expo-sharing'
 import { File, Paths } from 'expo-file-system'
 import { supabase } from '../lib/supabase'
+import { ensureCatalogSeeded } from '../lib/catalog'
 import { theme } from '../lib/theme'
-import type { BottleAnnotation } from '../lib/types'
+import type { BottleAnnotation, Product } from '../lib/types'
 
 interface ReviewRow {
   id: string
@@ -29,13 +31,29 @@ interface ReviewRow {
   thumbUrl?: string | null
 }
 
+interface ReviewPhoto {
+  id?: string
+  url: string
+  annotations: BottleAnnotation[]
+}
+
+interface CorrectionTarget {
+  photoIndex: number
+  annotationIndex: number
+  annotation: BottleAnnotation
+}
+
 export default function Review() {
   const router = useRouter()
   const { session_id } = useLocalSearchParams<{ session_id: string }>()
   const [loading, setLoading] = useState(true)
   const [exporting, setExporting] = useState(false)
-  const [photos, setPhotos] = useState<{ url: string; annotations: BottleAnnotation[] }[]>([])
+  const [photos, setPhotos] = useState<ReviewPhoto[]>([])
   const [rows, setRows] = useState<ReviewRow[]>([])
+  const [catalog, setCatalog] = useState<Product[]>([])
+  const [correction, setCorrection] = useState<CorrectionTarget | null>(null)
+  const [correctionQuery, setCorrectionQuery] = useState('')
+  const [savingCorrection, setSavingCorrection] = useState(false)
   // product-name (lowercase) -> { unit_price, thumb_url }
   const [productMeta, setProductMeta] = useState<
     Record<string, { price: number | null; thumb: string | null }>
@@ -48,17 +66,20 @@ export default function Review() {
 
   const loadSessionData = async () => {
     try {
+      const catalogRows = await ensureCatalogSeeded().catch(() => [] as Product[])
+      setCatalog(catalogRows)
+
       // Photos with annotations. Fall back if the column doesn't exist yet.
       let photoRows: any[] = []
       {
         const { data, error } = await (supabase as any)
           .from('photos')
-          .select('image_url, annotations')
+          .select('id, image_url, annotations')
           .eq('session_id', session_id)
         if (error) {
           const fallback = await (supabase as any)
             .from('photos')
-            .select('image_url')
+            .select('id, image_url')
             .eq('session_id', session_id)
           photoRows = (fallback.data as any[]) ?? []
         } else {
@@ -66,6 +87,7 @@ export default function Review() {
         }
       }
       const loadedPhotos = photoRows.map((p) => ({
+        id: p.id as string | undefined,
         url: p.image_url as string,
         annotations: Array.isArray(p.annotations) ? (p.annotations as BottleAnnotation[]) : [],
       }))
@@ -232,6 +254,68 @@ export default function Review() {
     return { sum: Math.round(sum * 100) / 100, partial }
   }, [finals])
 
+  const correctionMatches = useMemo(() => {
+    const q = correctionQuery.trim().toLowerCase()
+    const bottles = catalog.filter((p) => /bottle/i.test(p.count_unit ?? ''))
+    if (!q) return bottles.slice(0, 60)
+    return bottles.filter((p) => p.name.toLowerCase().includes(q)).slice(0, 60)
+  }, [catalog, correctionQuery])
+
+  const openCorrection = (
+    photoIndex: number,
+    annotationIndex: number,
+    annotation: BottleAnnotation
+  ) => {
+    setCorrection({ photoIndex, annotationIndex, annotation })
+    setCorrectionQuery(annotation.product === 'Unknown bottle' ? '' : annotation.product)
+  }
+
+  const saveAnnotationCorrection = async (productName: string) => {
+    if (!correction) return
+    const photo = photos[correction.photoIndex]
+    if (!photo) return
+    setSavingCorrection(true)
+    try {
+      const nextAnnotations = photo.annotations.map((a, i) =>
+        i === correction.annotationIndex
+          ? { ...a, product: productName, status: 'matched' as const, confidence: 1 }
+          : a
+      )
+      setPhotos((prev) =>
+        prev.map((p, i) =>
+          i === correction.photoIndex ? { ...p, annotations: nextAnnotations } : p
+        )
+      )
+      if (photo.id) {
+        await (supabase as any)
+          .from('photos')
+          .update({ annotations: nextAnnotations } as any)
+          .eq('id', photo.id)
+      }
+      const { error } = await (supabase as any)
+        .from('training_annotations')
+        .insert({
+          session_id,
+          photo_id: photo.id ?? null,
+          image_url: photo.url,
+          bbox: correction.annotation.bbox,
+          predicted_product: correction.annotation.product,
+          corrected_product: productName,
+          confidence: correction.annotation.confidence ?? null,
+          source: 'review-overlay',
+          status: 'pending',
+        } as any)
+      if (error) throw error
+      setCorrection(null)
+      setCorrectionQuery('')
+      Alert.alert('Saved', 'Correction saved for training.')
+    } catch (e: any) {
+      Alert.alert('Save failed', String(e?.message ?? e))
+    } finally {
+      setSavingCorrection(false)
+    }
+  }
+
   const saveCounts = async () => {
     try {
       if (finals.length === 0) return Alert.alert('No data', 'Add at least one product with a count.')
@@ -320,7 +404,13 @@ export default function Review() {
               contentContainerStyle={{ paddingHorizontal: 20, gap: 12 }}
             >
               {photos.map((p, i) => (
-                <AnnotatedPhoto key={`${p.url}-${i}`} url={p.url} annotations={p.annotations} />
+                <AnnotatedPhoto
+                  key={`${p.url}-${i}`}
+                  url={p.url}
+                  annotations={p.annotations}
+                  photoIndex={i}
+                  onCorrect={openCorrection}
+                />
               ))}
             </ScrollView>
             {hasAnyBoxes && (
@@ -630,6 +720,87 @@ export default function Review() {
           </Pressable>
         </View>
       </ScrollView>
+
+      <Modal visible={!!correction} transparent animationType="fade">
+        <View
+          style={{
+            flex: 1,
+            backgroundColor: 'rgba(0,0,0,0.72)',
+            justifyContent: 'center',
+            padding: 20,
+          }}
+        >
+          <View
+            style={{
+              backgroundColor: theme.surface,
+              borderRadius: 12,
+              borderWidth: 1,
+              borderColor: theme.border,
+              padding: 14,
+              maxHeight: '78%',
+            }}
+          >
+            <Text style={{ color: theme.text, fontSize: 16, fontWeight: '700' }}>
+              Correct bottle
+            </Text>
+            {!!correction && (
+              <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 4 }}>
+                Current: {correction.annotation.product}
+              </Text>
+            )}
+            <TextInput
+              value={correctionQuery}
+              onChangeText={setCorrectionQuery}
+              autoFocus
+              placeholder="Search references"
+              placeholderTextColor={theme.textFaint}
+              style={{
+                backgroundColor: theme.surfaceAlt,
+                color: theme.text,
+                borderRadius: 10,
+                paddingHorizontal: 12,
+                paddingVertical: 10,
+                marginTop: 12,
+                marginBottom: 10,
+              }}
+            />
+            <ScrollView style={{ maxHeight: 330 }}>
+              {correctionMatches.map((product) => (
+                <Pressable
+                  key={product.id}
+                  disabled={savingCorrection}
+                  onPress={() => saveAnnotationCorrection(product.name)}
+                  style={({ pressed }) => ({
+                    paddingVertical: 11,
+                    paddingHorizontal: 10,
+                    borderRadius: 8,
+                    backgroundColor: pressed ? '#26262a' : 'transparent',
+                  })}
+                >
+                  <Text style={{ color: theme.text, fontSize: 13 }} numberOfLines={1}>
+                    {product.name}
+                  </Text>
+                </Pressable>
+              ))}
+            </ScrollView>
+            <Pressable
+              disabled={savingCorrection}
+              onPress={() => setCorrection(null)}
+              style={({ pressed }) => ({
+                paddingVertical: 12,
+                alignItems: 'center',
+                borderRadius: 10,
+                marginTop: 10,
+                backgroundColor: pressed ? '#26262a' : theme.surfaceAlt,
+              })}
+            >
+              <Text style={{ color: theme.textMuted, fontSize: 13, fontWeight: '600' }}>
+                Cancel
+              </Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
     </View>
   )
 }
@@ -645,9 +816,13 @@ const STATUS_COLORS: Record<BottleAnnotation['status'], string> = {
 function AnnotatedPhoto({
   url,
   annotations,
+  photoIndex,
+  onCorrect,
 }: {
   url: string
   annotations: BottleAnnotation[]
+  photoIndex: number
+  onCorrect?: (photoIndex: number, annotationIndex: number, annotation: BottleAnnotation) => void
 }) {
   const [resolvedUrl, setResolvedUrl] = useState<string>(url)
   const [dims, setDims] = useState<{ w: number; h: number } | null>(null)
@@ -822,6 +997,25 @@ function AnnotatedPhoto({
             <Text style={{ color: '#6b7280', fontSize: 10, marginTop: 6 }}>
               Tap outside to close
             </Text>
+            <Pressable
+              onPress={() => {
+                const annotation = annotations[selected]
+                if (annotation) onCorrect?.(photoIndex, selected, annotation)
+                setSelected(null)
+              }}
+              style={({ pressed }) => ({
+                marginTop: 10,
+                paddingVertical: 9,
+                paddingHorizontal: 12,
+                borderRadius: 8,
+                backgroundColor: pressed ? '#e7e7e9' : '#fff',
+                alignItems: 'center',
+              })}
+            >
+              <Text style={{ color: '#111827', fontSize: 12, fontWeight: '700' }}>
+                Correct label
+              </Text>
+            </Pressable>
           </View>
         </Pressable>
       )}
