@@ -937,6 +937,15 @@ function AnnotatedPhoto({
           const width = bw * scaleX
           const height = bh * scaleY
           const color = STATUS_COLORS[a.status] ?? STATUS_COLORS.unknown
+          // Bottle silhouette: a narrow neck on top centered, blending into a
+          // rounded body below. We draw two overlapping Views with the same
+          // border color so the shape outlines an individual bottle instead
+          // of a plain rectangle. The wrapping Pressable owns the hit area.
+          const neckW = Math.max(4, width * 0.32)
+          const neckH = Math.max(4, height * 0.18)
+          const bodyTop = neckH * 0.78 // overlap so neck/body merge cleanly
+          const bodyH = height - bodyTop
+          const bodyRadius = Math.min(width * 0.45, height * 0.18, 18)
           return (
             <Pressable
               key={i}
@@ -947,13 +956,46 @@ function AnnotatedPhoto({
                 top,
                 width,
                 height,
-                borderWidth: 2,
-                borderColor: color,
-                backgroundColor: color,
-                opacity: 0.35,
-                borderRadius: 3,
+                backgroundColor: 'transparent',
               }}
-            />
+            >
+              {/* Neck */}
+              <View
+                pointerEvents="none"
+                style={{
+                  position: 'absolute',
+                  left: (width - neckW) / 2,
+                  top: 0,
+                  width: neckW,
+                  height: neckH,
+                  borderTopLeftRadius: neckW * 0.35,
+                  borderTopRightRadius: neckW * 0.35,
+                  borderWidth: 2,
+                  borderColor: color,
+                  backgroundColor: color,
+                  opacity: 0.85,
+                }}
+              />
+              {/* Body */}
+              <View
+                pointerEvents="none"
+                style={{
+                  position: 'absolute',
+                  left: 0,
+                  top: bodyTop,
+                  width,
+                  height: bodyH,
+                  borderTopLeftRadius: bodyRadius * 1.4,
+                  borderTopRightRadius: bodyRadius * 1.4,
+                  borderBottomLeftRadius: bodyRadius,
+                  borderBottomRightRadius: bodyRadius,
+                  borderWidth: 2,
+                  borderColor: color,
+                  backgroundColor: color,
+                  opacity: 0.35,
+                }}
+              />
+            </Pressable>
           )
         })}
       {/* Popup: tap a bottle, see its identity; tap backdrop to dismiss. */}
