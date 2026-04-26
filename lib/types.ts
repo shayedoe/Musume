@@ -63,6 +63,8 @@ export interface BottleAnnotation {
   product: string
   status: 'matched' | 'identified' | 'unknown'
   confidence: number
+  // Optional segmentation polygon (e.g. SAM3 mask), normalized 0..1.
+  polygon?: Array<[number, number]>
 }
 
 export interface VisionAnalysisResponse {

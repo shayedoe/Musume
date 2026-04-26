@@ -14,6 +14,11 @@ const ROBOFLOW_MODEL = Deno.env.get('ROBOFLOW_MODEL')
 const ROBOFLOW_API_KEY = Deno.env.get('ROBOFLOW_API_KEY')
 const ROBOFLOW_CONFIDENCE = parseFloat(Deno.env.get('ROBOFLOW_CONFIDENCE') ?? '0.75')
 const ROBOFLOW_OVERLAP = parseFloat(Deno.env.get('ROBOFLOW_OVERLAP') ?? '0.3')
+// Roboflow Hosted Workflow (preferred when configured). Returns SAM3 masks +
+// VLM-derived product labels in one call. Set:
+//   supabase secrets set ROBOFLOW_WORKSPACE=<workspace> ROBOFLOW_WORKFLOW=<workflow_id>
+const ROBOFLOW_WORKSPACE = Deno.env.get('ROBOFLOW_WORKSPACE')
+const ROBOFLOW_WORKFLOW = Deno.env.get('ROBOFLOW_WORKFLOW')
 const TILE_OVERLAP = 0.1 // 10% overlap so bottles on seams still get counted in at least one tile
 
 const SYSTEM_PROMPT = `You are a meticulous bar/stock-room inventory counter.
@@ -98,6 +103,10 @@ interface GlobalBottle {
   gw: number
   gh: number
   source_tile: string
+  // Optional segmentation polygon, normalized to the full image (0..1).
+  // When present (e.g. SAM3 mask from a Roboflow Workflow) the client can
+  // render an actual outline of the bottle instead of a generic silhouette.
+  polygon?: Array<[number, number]>
 }
 
 function snapFill(v: unknown): number {
@@ -604,6 +613,12 @@ function annotationsFromBottles(bottles: GlobalBottle[]) {
         : b.matched_reference
           ? 'matched'
           : 'identified'
+    const polygon = Array.isArray(b.polygon) && b.polygon.length >= 3
+      ? b.polygon.map(([x, y]) => [
+          Math.max(0, Math.min(1, x)),
+          Math.max(0, Math.min(1, y)),
+        ] as [number, number])
+      : undefined
     return {
       bbox: [
         Math.max(0, Math.min(1, b.gx)),
@@ -614,6 +629,7 @@ function annotationsFromBottles(bottles: GlobalBottle[]) {
       product: b.product,
       status,
       confidence: b.confidence,
+      ...(polygon ? { polygon } : {}),
     }
   })
 }
@@ -749,6 +765,239 @@ async function identifyBottleCrop(
     }
   } catch (e: any) {
     return { ok: false, reason: String(e?.message ?? e).slice(0, 200) }
+  }
+}
+
+// ---------- Roboflow Hosted Workflow (SAM3 + OCR + VLM) ----------
+//
+// Calls a Roboflow Workflow that performs:
+//   1. SAM3 instance segmentation (returns masks + bboxes per bottle).
+//   2. Per-crop OCR + GPT-4o product identification.
+//   3. Detection class replacement so each detection's `class` is the
+//      identified product (brand + name) instead of generic "bottle".
+//
+// We then convert each prediction into a GlobalBottle (with polygon) and
+// run our normal aggregate/annotation pipeline.
+
+interface WorkflowPrediction {
+  x: number
+  y: number
+  width: number
+  height: number
+  confidence: number
+  class?: string
+  class_name?: string
+  product?: string
+  product_name?: string
+  brand?: string
+  // SAM3 instance mask polygon, in pixel coords.
+  points?: Array<{ x: number; y: number }>
+}
+
+async function runRoboflowWorkflowApi(
+  imageBase64: string
+): Promise<{
+  detections: WorkflowPrediction[]
+  imageWidth: number
+  imageHeight: number
+  raw: any
+}> {
+  const url = `https://detect.roboflow.com/infer/workflows/${ROBOFLOW_WORKSPACE}/${ROBOFLOW_WORKFLOW}`
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      api_key: ROBOFLOW_API_KEY,
+      inputs: {
+        image: { type: 'base64', value: imageBase64 },
+      },
+    }),
+    signal: AbortSignal.timeout(120_000),
+  })
+  if (!res.ok) {
+    const text = await res.text().catch(() => '')
+    throw new Error(`workflow ${res.status}: ${text.slice(0, 300)}`)
+  }
+  const raw = await res.json()
+
+  let detections: WorkflowPrediction[] = []
+  let imageWidth = 0
+  let imageHeight = 0
+
+  // Workflow responses are nested: { outputs: [ { <block_name>: { predictions: [...] | { predictions: [...] } } } ] }
+  // Walk every node and collect detection-shaped objects + image dims.
+  const visit = (node: any) => {
+    if (!node || typeof node !== 'object') return
+    if (node.image && typeof node.image === 'object') {
+      const w = Number(node.image.width)
+      const h = Number(node.image.height)
+      if (Number.isFinite(w) && w > 0) imageWidth = imageWidth || w
+      if (Number.isFinite(h) && h > 0) imageHeight = imageHeight || h
+    }
+    if (Array.isArray(node.predictions)) {
+      for (const p of node.predictions) {
+        if (
+          p && typeof p === 'object' &&
+          typeof p.x === 'number' && typeof p.y === 'number' &&
+          typeof p.width === 'number' && typeof p.height === 'number'
+        ) {
+          detections.push(p as WorkflowPrediction)
+        }
+      }
+    }
+    if (Array.isArray(node)) {
+      for (const v of node) visit(v)
+      return
+    }
+    for (const k of Object.keys(node)) {
+      const v = (node as any)[k]
+      if (v && typeof v === 'object') visit(v)
+    }
+  }
+  visit(raw)
+
+  // Some workflows return the image size at the top level of an output instead.
+  if ((!imageWidth || !imageHeight) && Array.isArray(raw?.outputs)) {
+    for (const o of raw.outputs) {
+      if (o?.image?.width && o?.image?.height) {
+        imageWidth = imageWidth || Number(o.image.width)
+        imageHeight = imageHeight || Number(o.image.height)
+      }
+    }
+  }
+
+  // Dedupe predictions that show up under multiple output blocks (the same
+  // SAM3 detections often pass through several visualization steps).
+  const seen = new Set<string>()
+  detections = detections.filter((p) => {
+    const key = `${p.x.toFixed(2)}|${p.y.toFixed(2)}|${p.width.toFixed(2)}|${p.height.toFixed(2)}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+
+  return { detections, imageWidth, imageHeight, raw }
+}
+
+function workflowProductLabel(p: WorkflowPrediction): string {
+  // After "Detections Classes Replacement" the product name lands on
+  // `class` (or `class_name`). Some VLM outputs surface it as `product`
+  // / `product_name` instead. Fall back to a brand-prefixed name when both
+  // are present.
+  const candidates = [p.product_name, p.product, p.class_name, p.class]
+    .map((v) => (typeof v === 'string' ? v.trim() : ''))
+    .filter(Boolean)
+  let label = candidates[0] || 'Unknown bottle'
+  if (p.brand && typeof p.brand === 'string') {
+    const brand = p.brand.trim()
+    if (brand && !label.toLowerCase().includes(brand.toLowerCase())) {
+      label = `${brand} ${label}`
+    }
+  }
+  // Generic catch-alls -> Unknown.
+  if (/^(bottle|object|item)$/i.test(label)) return 'Unknown bottle'
+  return label
+}
+
+async function detectWithRoboflowWorkflow(
+  imageBase64: string,
+  shelfBytes: Uint8Array,
+  classNameMap: Map<string, string>
+): Promise<{
+  detections: Array<{
+    product: string
+    count: number
+    fill_level: number
+    confidence: number
+    barcode: string | null
+    notes: string | null
+  }>
+  annotations: Array<{
+    bbox: [number, number, number, number]
+    product: string
+    status: 'matched' | 'identified' | 'unknown'
+    confidence: number
+    polygon?: Array<[number, number]>
+  }>
+  warnings: string[]
+  meta: Record<string, unknown>
+}> {
+  const { detections: preds, imageWidth, imageHeight, raw } =
+    await runRoboflowWorkflowApi(imageBase64)
+
+  let imgW = imageWidth
+  let imgH = imageHeight
+  if (!imgW || !imgH) {
+    try {
+      const img = (await decode(shelfBytes)) as Image
+      imgW = img.width
+      imgH = img.height
+    } catch (_e) {
+      imgW = imgW || 1
+      imgH = imgH || 1
+    }
+  }
+
+  const rawGlobalBottles: GlobalBottle[] = []
+  for (const p of preds) {
+    if ((p.confidence ?? 0) < ROBOFLOW_CONFIDENCE * 0.7) continue
+    const product = workflowProductLabel(p)
+    const matchKey = product.toLowerCase().replace(/\s+/g, '_')
+    const matched_reference =
+      classNameMap.has(matchKey) || classNameMap.has(product.toLowerCase())
+    const nx = (p.x - p.width / 2) / imgW
+    const ny = (p.y - p.height / 2) / imgH
+    const nw = p.width / imgW
+    const nh = p.height / imgH
+    const polygon: Array<[number, number]> | undefined =
+      Array.isArray(p.points) && p.points.length >= 3
+        ? p.points
+            .map((pt) => [pt.x / imgW, pt.y / imgH] as [number, number])
+            .filter(([x, y]) => Number.isFinite(x) && Number.isFinite(y))
+        : undefined
+    rawGlobalBottles.push({
+      product,
+      fill_level: 1,
+      confidence: p.confidence ?? 0.7,
+      matched_reference,
+      barcode: null,
+      notes: null,
+      gx: nx,
+      gy: ny,
+      gw: nw,
+      gh: nh,
+      source_tile: 'workflow',
+      polygon,
+    })
+  }
+
+  // SAM3 already produces clean instance segmentation, so we skip the
+  // heavy column-merge step here. We still run NMS + light geometry
+  // filtering to catch the rare duplicate the workflow leaves behind.
+  const cleaned = nmsBottles(rawGlobalBottles.filter(isBottleLikeBox), 0.5)
+
+  // If the bottle-likeness filter killed everything (e.g. unusual angle),
+  // fall back to NMS on the raw detections rather than returning empty.
+  const finalBottles = cleaned.length ? cleaned : nmsBottles(rawGlobalBottles, 0.5)
+
+  const detections = aggregate(finalBottles)
+  const annotations = annotationsFromBottles(finalBottles)
+
+  return {
+    detections,
+    annotations,
+    warnings: preds.length === 0 ? ['workflow returned no detections'] : [],
+    meta: {
+      backend: 'roboflow-workflow',
+      workspace: ROBOFLOW_WORKSPACE,
+      workflow: ROBOFLOW_WORKFLOW,
+      raw_predictions: preds.length,
+      filtered_bottles: finalBottles.length,
+      unique_products: detections.length,
+      image: { width: imgW, height: imgH },
+      with_polygons: finalBottles.filter((b) => b.polygon).length,
+      output_blocks: Array.isArray(raw?.outputs) ? raw.outputs.length : 0,
+    },
   }
 }
 
@@ -1011,7 +1260,28 @@ Deno.serve(async (req) => {
 
   let roboflowWarning: string | null = null
 
-  // ---- Roboflow path (preferred when model is configured) ----
+  // ---- Roboflow Hosted Workflow path (preferred — SAM3 + OCR + GPT-4o) ----
+  if (ROBOFLOW_WORKSPACE && ROBOFLOW_WORKFLOW && ROBOFLOW_API_KEY) {
+    const classNameMap = new Map<string, string>()
+    const refs = Array.isArray(payload.references) ? payload.references : []
+    for (const r of refs) {
+      if (r?.product) classNameMap.set(r.product.toLowerCase().replace(/\s+/g, '_'), r.product)
+    }
+    const cat = Array.isArray(payload.catalog) ? payload.catalog : []
+    for (const name of cat) {
+      classNameMap.set(String(name).toLowerCase().replace(/\s+/g, '_'), String(name))
+    }
+    try {
+      const shelfBytes = base64ToBytes(image)
+      const out = await detectWithRoboflowWorkflow(image, shelfBytes, classNameMap)
+      return json(out)
+    } catch (e: any) {
+      roboflowWarning = `roboflow workflow failed, fell back: ${String(e).slice(0, 240)}`
+      console.warn('[vision-analyze] roboflow workflow failed, falling back:', String(e))
+    }
+  }
+
+  // ---- Roboflow simple detector path (when only ROBOFLOW_MODEL is set) ----
   if (ROBOFLOW_MODEL && ROBOFLOW_API_KEY) {
     // Build a class-slug -> pretty-product-name map from the request's
     // reference list + catalog so "titos_vodka" renders as "Tito's Vodka".

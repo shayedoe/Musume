@@ -242,11 +242,25 @@ export async function analyzeShelfImage(
         a?.status === 'matched' || a?.status === 'identified' || a?.status === 'unknown'
           ? a.status
           : 'identified'
+      // Optional SAM3 / segmentation polygon, normalized 0..1.
+      let polygon: Array<[number, number]> | undefined
+      if (Array.isArray(a?.polygon) && a.polygon.length >= 3) {
+        const pts: Array<[number, number]> = []
+        for (const pt of a.polygon) {
+          if (Array.isArray(pt) && pt.length === 2) {
+            const px = Number(pt[0])
+            const py = Number(pt[1])
+            if (Number.isFinite(px) && Number.isFinite(py)) pts.push([px, py])
+          }
+        }
+        if (pts.length >= 3) polygon = pts
+      }
       return {
         bbox: [x, y, w, h] as [number, number, number, number],
         product: String(a?.product ?? 'Unknown bottle'),
         status,
         confidence: Number(a?.confidence ?? 0.5),
+        ...(polygon ? { polygon } : {}),
       }
     })
     .filter((a): a is NonNullable<typeof a> => a !== null)

@@ -14,6 +14,7 @@ import {
 import { useRouter, useLocalSearchParams } from 'expo-router'
 import * as Sharing from 'expo-sharing'
 import { File, Paths } from 'expo-file-system'
+import Svg, { Polygon as SvgPolygon } from 'react-native-svg'
 import { supabase } from '../lib/supabase'
 import { ensureCatalogSeeded } from '../lib/catalog'
 import { theme } from '../lib/theme'
@@ -929,75 +930,117 @@ function AnnotatedPhoto({
           setLoadError(String(e?.nativeEvent?.error ?? 'image failed to load'))
         }}
       />
-      {showOverlay &&
-        annotations.map((a, i) => {
-          const [bx, by, bw, bh] = a.bbox
-          const left = offsetX + bx * scaleX
-          const top = offsetY + by * scaleY
-          const width = bw * scaleX
-          const height = bh * scaleY
-          const color = STATUS_COLORS[a.status] ?? STATUS_COLORS.unknown
-          // Bottle silhouette: a narrow neck on top centered, blending into a
-          // rounded body below. We draw two overlapping Views with the same
-          // border color so the shape outlines an individual bottle instead
-          // of a plain rectangle. The wrapping Pressable owns the hit area.
-          const neckW = Math.max(4, width * 0.32)
-          const neckH = Math.max(4, height * 0.18)
-          const bodyTop = neckH * 0.78 // overlap so neck/body merge cleanly
-          const bodyH = height - bodyTop
-          const bodyRadius = Math.min(width * 0.45, height * 0.18, 18)
-          return (
-            <Pressable
-              key={i}
-              onPress={() => setSelected(i)}
-              style={{
-                position: 'absolute',
-                left,
-                top,
-                width,
-                height,
-                backgroundColor: 'transparent',
-              }}
-            >
-              {/* Neck */}
-              <View
-                pointerEvents="none"
+      {showOverlay && (
+        <>
+          {/* Real SAM3 segmentation masks (when the backend returns polygons). */}
+          <Svg
+            width={W}
+            height={H}
+            style={{ position: 'absolute', left: 0, top: 0 }}
+            pointerEvents="none"
+          >
+            {annotations.map((a, i) => {
+              if (!a.polygon || a.polygon.length < 3) return null
+              const color = STATUS_COLORS[a.status] ?? STATUS_COLORS.unknown
+              const points = a.polygon
+                .map(([px, py]) => `${offsetX + px * scaleX},${offsetY + py * scaleY}`)
+                .join(' ')
+              return (
+                <SvgPolygon
+                  key={`mask-${i}`}
+                  points={points}
+                  fill={color}
+                  fillOpacity={0.35}
+                  stroke={color}
+                  strokeWidth={2}
+                />
+              )
+            })}
+          </Svg>
+          {annotations.map((a, i) => {
+            const [bx, by, bw, bh] = a.bbox
+            const left = offsetX + bx * scaleX
+            const top = offsetY + by * scaleY
+            const width = bw * scaleX
+            const height = bh * scaleY
+            const color = STATUS_COLORS[a.status] ?? STATUS_COLORS.unknown
+            const hasMask = !!(a.polygon && a.polygon.length >= 3)
+            // When we have a real mask, the Pressable is just a transparent
+            // hit area over the bbox. Otherwise we draw the bottle silhouette
+            // (neck + body) so each detection still looks like a bottle.
+            if (hasMask) {
+              return (
+                <Pressable
+                  key={i}
+                  onPress={() => setSelected(i)}
+                  style={{
+                    position: 'absolute',
+                    left,
+                    top,
+                    width,
+                    height,
+                    backgroundColor: 'transparent',
+                  }}
+                />
+              )
+            }
+            const neckW = Math.max(4, width * 0.32)
+            const neckH = Math.max(4, height * 0.18)
+            const bodyTop = neckH * 0.78
+            const bodyH = height - bodyTop
+            const bodyRadius = Math.min(width * 0.45, height * 0.18, 18)
+            return (
+              <Pressable
+                key={i}
+                onPress={() => setSelected(i)}
                 style={{
                   position: 'absolute',
-                  left: (width - neckW) / 2,
-                  top: 0,
-                  width: neckW,
-                  height: neckH,
-                  borderTopLeftRadius: neckW * 0.35,
-                  borderTopRightRadius: neckW * 0.35,
-                  borderWidth: 2,
-                  borderColor: color,
-                  backgroundColor: color,
-                  opacity: 0.85,
-                }}
-              />
-              {/* Body */}
-              <View
-                pointerEvents="none"
-                style={{
-                  position: 'absolute',
-                  left: 0,
-                  top: bodyTop,
+                  left,
+                  top,
                   width,
-                  height: bodyH,
-                  borderTopLeftRadius: bodyRadius * 1.4,
-                  borderTopRightRadius: bodyRadius * 1.4,
-                  borderBottomLeftRadius: bodyRadius,
-                  borderBottomRightRadius: bodyRadius,
-                  borderWidth: 2,
-                  borderColor: color,
-                  backgroundColor: color,
-                  opacity: 0.35,
+                  height,
+                  backgroundColor: 'transparent',
                 }}
-              />
-            </Pressable>
-          )
-        })}
+              >
+                <View
+                  pointerEvents="none"
+                  style={{
+                    position: 'absolute',
+                    left: (width - neckW) / 2,
+                    top: 0,
+                    width: neckW,
+                    height: neckH,
+                    borderTopLeftRadius: neckW * 0.35,
+                    borderTopRightRadius: neckW * 0.35,
+                    borderWidth: 2,
+                    borderColor: color,
+                    backgroundColor: color,
+                    opacity: 0.85,
+                  }}
+                />
+                <View
+                  pointerEvents="none"
+                  style={{
+                    position: 'absolute',
+                    left: 0,
+                    top: bodyTop,
+                    width,
+                    height: bodyH,
+                    borderTopLeftRadius: bodyRadius * 1.4,
+                    borderTopRightRadius: bodyRadius * 1.4,
+                    borderBottomLeftRadius: bodyRadius,
+                    borderBottomRightRadius: bodyRadius,
+                    borderWidth: 2,
+                    borderColor: color,
+                    backgroundColor: color,
+                    opacity: 0.35,
+                  }}
+                />
+              </Pressable>
+            )
+          })}
+        </>
+      )}
       {/* Popup: tap a bottle, see its identity; tap backdrop to dismiss. */}
       {selected !== null && annotations[selected] && (
         <Pressable
