@@ -101,22 +101,26 @@ Set it as a Supabase secret:
 
 ```powershell
 $env:Path = "$HOME\scoop\shims;$env:Path"
-$env:SUPABASE_ACCESS_TOKEN = "sbp_967afd7adcbd6cb4cd0397bafb58717b5f0250e9"
-supabase secrets set ROBOFLOW_MODEL=musume/1 --project-ref txgcqrymhuiivecpcsnh
+$env:SUPABASE_ACCESS_TOKEN = "<YOUR_SUPABASE_PERSONAL_ACCESS_TOKEN>"
+supabase secrets set ROBOFLOW_MODEL=musume/1 --project-ref <YOUR_PROJECT_REF>
 ```
 
 The edge function `vision-analyze` auto-routes to Roboflow on next request.
 No redeploy needed.
 
+> ⚠️ Never commit a real `SUPABASE_ACCESS_TOKEN` (`sbp_*`) or any
+> `SUPABASE_SERVICE_ROLE_KEY` to git. If you have, rotate it immediately at
+> https://supabase.com/dashboard/account/tokens.
+
 ## Tuning (once you're running)
 
 All configurable via Supabase secrets:
 
-| Secret                 | Default | What it does                                           |
-| ---------------------- | ------- | ------------------------------------------------------ |
-| `ROBOFLOW_MODEL`       | unset   | `<project>/<version>`. Unset = fall back to OpenAI.    |
-| `ROBOFLOW_CONFIDENCE`  | `0.4`   | Min confidence to keep a box. Raise to cut false pos.  |
-| `ROBOFLOW_OVERLAP`     | `0.3`   | NMS overlap threshold. Lower = more aggressive dedupe. |
+| Secret                | Default | What it does                                           |
+| --------------------- | ------- | ------------------------------------------------------ |
+| `ROBOFLOW_MODEL`      | unset   | `<project>/<version>`. Unset = fall back to OpenAI.    |
+| `ROBOFLOW_CONFIDENCE` | `0.62`  | Min confidence to keep a box. Raise to cut false pos.  |
+| `ROBOFLOW_OVERLAP`    | `0.22`  | NMS overlap threshold. Lower = more aggressive dedupe. |
 
 ## Retraining
 
