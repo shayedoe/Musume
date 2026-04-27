@@ -6,7 +6,7 @@ import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
 import { decode, Image } from 'https://deno.land/x/imagescript@1.2.17/mod.ts'
 
 const OPENAI_KEY = Deno.env.get('OPENAI_API_KEY')
-const MODEL = Deno.env.get('OPENAI_VISION_MODEL') ?? 'gpt-4o'
+const MODEL = Deno.env.get('OPENAI_VISION_MODEL') ?? 'gpt-4o-mini'
 const DEFAULT_GRID = Deno.env.get('VISION_TILE_GRID') ?? '2x2'
 const SELF_VERIFY_DEFAULT = (Deno.env.get('VISION_SELF_VERIFY') ?? '0') === '1'
 
@@ -17,6 +17,10 @@ const ROBOFLOW_MODEL = Deno.env.get('ROBOFLOW_MODEL')
 const ROBOFLOW_API_KEY = Deno.env.get('ROBOFLOW_API_KEY')
 const ROBOFLOW_CONFIDENCE = parseFloat(Deno.env.get('ROBOFLOW_CONFIDENCE') ?? '0.75')
 const ROBOFLOW_OVERLAP = parseFloat(Deno.env.get('ROBOFLOW_OVERLAP') ?? '0.3')
+// When set to '1', skip the OpenAI per-crop SKU identification step entirely
+// and trust whatever class labels Roboflow returns. Useful while training a
+// custom multi-class model, or to keep token usage at zero.
+const ROBOFLOW_ONLY = (Deno.env.get('ROBOFLOW_ONLY') ?? '0') === '1'
 // Roboflow Hosted Workflow (preferred when configured). Returns SAM3 masks +
 // VLM-derived product labels in one call. Set:
 //   supabase secrets set ROBOFLOW_WORKSPACE=<workspace> ROBOFLOW_WORKFLOW=<workflow_id>
@@ -1071,7 +1075,10 @@ async function detectWithRoboflow(
   // multi-class (SKU-level). If single-class, we need to identify each
   // crop via OpenAI. If multi-class, we trust Roboflow's class labels.
   const distinctClasses = new Set(preds.map((p) => (p.class ?? '').toLowerCase().trim()))
+  // When ROBOFLOW_ONLY is set, never run the OpenAI identification step —
+  // trust Roboflow's class labels (or generic 'bottle') even if single-class.
   const singleClass =
+    !ROBOFLOW_ONLY &&
     distinctClasses.size <= 1 &&
     (distinctClasses.has('bottle') || distinctClasses.has(''))
 
