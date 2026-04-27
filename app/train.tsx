@@ -19,10 +19,25 @@ import { theme } from '../lib/theme'
 import type { Product } from '../lib/types'
 
 type TrainSlot = 'front' | 'back' | 'barcode'
+type TrainMode = 'reference' | 'shelf'
 
 interface LocalShot {
   uri: string
   base64: string
+  width: number
+  height: number
+}
+
+interface ShelfAnnotation {
+  id: string
+  bbox: [number, number, number, number]
+  product: string
+  notes?: string
+}
+
+interface Point {
+  x: number
+  y: number
 }
 
 const SLOTS: Array<{ key: TrainSlot; label: string; hint: string; priority: number }> = [
@@ -46,13 +61,18 @@ const SLOTS: Array<{ key: TrainSlot; label: string; hint: string; priority: numb
   },
 ]
 
-async function toJpegSmall(uri: string): Promise<LocalShot> {
-  const result = await ImageManipulator.manipulateAsync(uri, [{ resize: { width: 900 } }], {
-    compress: 0.8,
+async function toJpegSmall(uri: string, width = 900): Promise<LocalShot> {
+  const result = await ImageManipulator.manipulateAsync(uri, [{ resize: { width } }], {
+    compress: 0.82,
     format: ImageManipulator.SaveFormat.JPEG,
     base64: true,
   })
-  return { uri: result.uri, base64: result.base64 ?? '' }
+  return {
+    uri: result.uri,
+    base64: result.base64 ?? '',
+    width: result.width,
+    height: result.height,
+  }
 }
 
 function base64ToUint8Array(b64: string): Uint8Array {
@@ -82,15 +102,36 @@ function safeName(value: string): string {
   return value.replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '').toLowerCase()
 }
 
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value))
+}
+
+function makeBbox(a: Point, b: Point): [number, number, number, number] | null {
+  const x1 = clamp01(Math.min(a.x, b.x))
+  const y1 = clamp01(Math.min(a.y, b.y))
+  const x2 = clamp01(Math.max(a.x, b.x))
+  const y2 = clamp01(Math.max(a.y, b.y))
+  const w = x2 - x1
+  const h = y2 - y1
+  if (w < 0.025 || h < 0.05) return null
+  return [x1, y1, w, h]
+}
+
 export default function Train() {
   const router = useRouter()
+  const [mode, setMode] = useState<TrainMode>('reference')
   const [catalog, setCatalog] = useState<Product[]>([])
   const [search, setSearch] = useState('')
   const [selected, setSelected] = useState<Product | null>(null)
+  const [customName, setCustomName] = useState('')
   const [shots, setShots] = useState<Partial<Record<TrainSlot, LocalShot>>>({})
+  const [shelfShot, setShelfShot] = useState<LocalShot | null>(null)
+  const [annotations, setAnnotations] = useState<ShelfAnnotation[]>([])
+  const [pendingPoint, setPendingPoint] = useState<Point | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [status, setStatus] = useState('')
+  const [imageLayout, setImageLayout] = useState({ width: 1, height: 1 })
 
   useEffect(() => {
     ensureCatalogSeeded()
@@ -106,6 +147,8 @@ export default function Train() {
     return bottles.filter((p) => p.name.toLowerCase().includes(q)).slice(0, 80)
   }, [catalog, search, selected])
 
+  const activeProductName = (customName.trim() || selected?.name || '').trim()
+
   const captureSlot = async (slot: TrainSlot) => {
     const { status: perm } = await ImagePicker.requestCameraPermissionsAsync()
     if (perm !== 'granted') {
@@ -119,9 +162,100 @@ export default function Train() {
       base64: false,
     })
     if (!result.canceled && result.assets[0]) {
-      const jpeg = await toJpegSmall(result.assets[0].uri)
+      const jpeg = await toJpegSmall(result.assets[0].uri, 900)
       if (jpeg.base64) setShots((prev) => ({ ...prev, [slot]: jpeg }))
     }
+  }
+
+  const chooseShelfImage = async () => {
+    const { status: perm } = await ImagePicker.requestMediaLibraryPermissionsAsync()
+    if (perm !== 'granted') {
+      Alert.alert('Permission needed', 'Photo library permission is required.')
+      return
+    }
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      allowsEditing: false,
+      quality: 0.85,
+      base64: false,
+    })
+    if (!result.canceled && result.assets[0]) {
+      setStatus('Preparing image...')
+      try {
+        const jpeg = await toJpegSmall(result.assets[0].uri, 1400)
+        if (jpeg.base64) {
+          setShelfShot(jpeg)
+          setAnnotations([])
+          setPendingPoint(null)
+        }
+      } finally {
+        setStatus('')
+      }
+    }
+  }
+
+  const captureShelfImage = async () => {
+    const { status: perm } = await ImagePicker.requestCameraPermissionsAsync()
+    if (perm !== 'granted') {
+      Alert.alert('Permission needed', 'Camera permission is required.')
+      return
+    }
+    const result = await ImagePicker.launchCameraAsync({
+      mediaTypes: ImagePicker.MediaTypeOptions.Images,
+      allowsEditing: false,
+      quality: 0.85,
+      base64: false,
+    })
+    if (!result.canceled && result.assets[0]) {
+      setStatus('Preparing image...')
+      try {
+        const jpeg = await toJpegSmall(result.assets[0].uri, 1400)
+        if (jpeg.base64) {
+          setShelfShot(jpeg)
+          setAnnotations([])
+          setPendingPoint(null)
+        }
+      } finally {
+        setStatus('')
+      }
+    }
+  }
+
+  const handleShelfPress = (event: any) => {
+    if (!shelfShot) return
+    if (!activeProductName) {
+      Alert.alert('Name needed', 'Select a product or type a custom bottle name before drawing a box.')
+      return
+    }
+    const x = clamp01(event.nativeEvent.locationX / Math.max(imageLayout.width, 1))
+    const y = clamp01(event.nativeEvent.locationY / Math.max(imageLayout.height, 1))
+    const point = { x, y }
+
+    if (!pendingPoint) {
+      setPendingPoint(point)
+      return
+    }
+
+    const bbox = makeBbox(pendingPoint, point)
+    if (!bbox) {
+      setPendingPoint(null)
+      Alert.alert('Box too small', 'Tap the top-left and bottom-right corners of the full visible bottle.')
+      return
+    }
+
+    setAnnotations((prev) => [
+      ...prev,
+      {
+        id: `${Date.now()}_${prev.length}`,
+        bbox,
+        product: activeProductName,
+      },
+    ])
+    setPendingPoint(null)
+  }
+
+  const removeAnnotation = (id: string) => {
+    setAnnotations((prev) => prev.filter((a) => a.id !== id))
   }
 
   const saveTrainingSet = async () => {
@@ -161,6 +295,50 @@ export default function Train() {
     }
   }
 
+  const saveShelfAnnotations = async () => {
+    if (!shelfShot) return Alert.alert('No image', 'Upload or capture a shelf image first.')
+    if (annotations.length === 0) return Alert.alert('No boxes', 'Tap two corners around each bottle before saving.')
+
+    setSaving(true)
+    setStatus('Saving labeled shelf image...')
+    try {
+      const bytes = base64ToUint8Array(shelfShot.base64)
+      const fileName = `training/shelf_${Date.now()}.jpg`
+      const { error: uploadError } = await supabase.storage
+        .from('inventory-images')
+        .upload(fileName, bytes, { contentType: 'image/jpeg', upsert: false })
+      if (uploadError) throw uploadError
+
+      const { data: urlData } = supabase.storage.from('inventory-images').getPublicUrl(fileName)
+      const imageUrl = (urlData as any).publicUrl
+
+      const rows = annotations.map((annotation) => ({
+        image_url: imageUrl,
+        bbox: annotation.bbox,
+        predicted_product: null,
+        corrected_product: annotation.product,
+        confidence: 1,
+        source: 'train-manual-shelf',
+        status: 'pending',
+        notes: `manual shelf annotation ${shelfShot.width}x${shelfShot.height}`,
+      }))
+
+      const { error: insertError } = await (supabase as any)
+        .from('training_annotations')
+        .insert(rows as any)
+      if (insertError) throw insertError
+
+      Alert.alert('Saved', `${annotations.length} bottle annotation${annotations.length === 1 ? '' : 's'} saved for training.`)
+      setAnnotations([])
+      setPendingPoint(null)
+    } catch (e: any) {
+      Alert.alert('Save failed', String(e?.message ?? e))
+    } finally {
+      setSaving(false)
+      setStatus('')
+    }
+  }
+
   return (
     <View style={{ flex: 1, backgroundColor: theme.bg }}>
       <StatusBar barStyle="light-content" backgroundColor={theme.bg} />
@@ -173,8 +351,13 @@ export default function Train() {
           Train
         </Text>
         <Text style={{ color: theme.textMuted, fontSize: 13, lineHeight: 18, marginTop: 6 }}>
-          Add clean front, back, and barcode references for one bottle. These improve product matching immediately and can later be exported into Roboflow.
+          Add clean product references, or label bottles directly in a shelf image for the Roboflow training queue.
         </Text>
+
+        <View style={{ flexDirection: 'row', gap: 8, marginTop: 18 }}>
+          <ModeButton label="References" active={mode === 'reference'} onPress={() => setMode('reference')} />
+          <ModeButton label="Shelf labels" active={mode === 'shelf'} onPress={() => setMode('shelf')} />
+        </View>
 
         <TextInput
           value={search}
@@ -192,6 +375,24 @@ export default function Train() {
           }}
         />
 
+        {mode === 'shelf' && (
+          <TextInput
+            value={customName}
+            onChangeText={setCustomName}
+            placeholder="Or type custom bottle name"
+            placeholderTextColor={theme.textFaint}
+            style={{
+              backgroundColor: theme.surface,
+              borderRadius: 10,
+              paddingHorizontal: 14,
+              paddingVertical: 12,
+              fontSize: 15,
+              color: theme.text,
+              marginTop: 10,
+            }}
+          />
+        )}
+
         {loading ? (
           <ActivityIndicator color={theme.text} style={{ marginTop: 24 }} />
         ) : (
@@ -202,7 +403,10 @@ export default function Train() {
                 return (
                   <Pressable
                     key={product.id}
-                    onPress={() => setSelected(product)}
+                    onPress={() => {
+                      setSelected(product)
+                      if (mode === 'shelf') setCustomName('')
+                    }}
                     style={({ pressed }) => ({
                       paddingVertical: 11,
                       paddingHorizontal: 12,
@@ -232,7 +436,7 @@ export default function Train() {
           </View>
         )}
 
-        {selected && (
+        {mode === 'reference' && selected && (
           <View style={{ marginTop: 18 }}>
             <Text style={{ color: theme.text, fontSize: 15, fontWeight: '700', marginBottom: 10 }}>
               {selected.name}
@@ -321,7 +525,197 @@ export default function Train() {
             </Pressable>
           </View>
         )}
+
+        {mode === 'shelf' && (
+          <View style={{ marginTop: 18 }}>
+            <Text style={{ color: theme.text, fontSize: 15, fontWeight: '700' }}>
+              Shelf image labels
+            </Text>
+            <Text style={{ color: theme.textMuted, fontSize: 12, lineHeight: 17, marginTop: 4 }}>
+              Select or type a bottle name, then tap the top-left and bottom-right corners of that bottle. Repeat for each visible bottle.
+            </Text>
+
+            <View style={{ flexDirection: 'row', gap: 10, marginTop: 12 }}>
+              <ModeButton label="Upload image" onPress={chooseShelfImage} />
+              <ModeButton label="Take photo" onPress={captureShelfImage} />
+            </View>
+
+            {!!activeProductName && (
+              <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 10 }}>
+                Current label: {activeProductName}
+              </Text>
+            )}
+
+            {shelfShot ? (
+              <View style={{ marginTop: 12 }}>
+                <Pressable
+                  onPress={handleShelfPress}
+                  onLayout={(event) => setImageLayout(event.nativeEvent.layout)}
+                  style={{
+                    width: '100%',
+                    aspectRatio: shelfShot.width / Math.max(shelfShot.height, 1),
+                    borderRadius: 12,
+                    overflow: 'hidden',
+                    backgroundColor: theme.surface,
+                    borderWidth: 1,
+                    borderColor: theme.border,
+                  }}
+                >
+                  <Image
+                    source={{ uri: shelfShot.uri }}
+                    style={{ position: 'absolute', left: 0, top: 0, width: '100%', height: '100%' }}
+                    resizeMode="stretch"
+                  />
+                  {annotations.map((annotation, index) => {
+                    const [x, y, w, h] = annotation.bbox
+                    return (
+                      <View
+                        key={annotation.id}
+                        pointerEvents="none"
+                        style={{
+                          position: 'absolute',
+                          left: `${x * 100}%`,
+                          top: `${y * 100}%`,
+                          width: `${w * 100}%`,
+                          height: `${h * 100}%`,
+                          borderWidth: 2,
+                          borderColor: '#34C759',
+                          backgroundColor: 'rgba(52,199,89,0.14)',
+                        }}
+                      >
+                        <Text
+                          numberOfLines={1}
+                          style={{
+                            position: 'absolute',
+                            left: 0,
+                            top: -22,
+                            maxWidth: 180,
+                            color: '#000',
+                            backgroundColor: '#34C759',
+                            paddingHorizontal: 5,
+                            paddingVertical: 2,
+                            fontSize: 10,
+                            fontWeight: '700',
+                          }}
+                        >
+                          {index + 1}. {annotation.product}
+                        </Text>
+                      </View>
+                    )
+                  })}
+                  {pendingPoint && (
+                    <View
+                      pointerEvents="none"
+                      style={{
+                        position: 'absolute',
+                        left: `${pendingPoint.x * 100}%`,
+                        top: `${pendingPoint.y * 100}%`,
+                        width: 10,
+                        height: 10,
+                        marginLeft: -5,
+                        marginTop: -5,
+                        borderRadius: 5,
+                        backgroundColor: '#ffcc00',
+                      }}
+                    />
+                  )}
+                </Pressable>
+
+                <View style={{ flexDirection: 'row', gap: 10, marginTop: 10 }}>
+                  <ModeButton label="Undo point" onPress={() => setPendingPoint(null)} />
+                  <ModeButton
+                    label="Clear boxes"
+                    onPress={() => {
+                      setAnnotations([])
+                      setPendingPoint(null)
+                    }}
+                  />
+                </View>
+
+                <View style={{ gap: 8, marginTop: 12 }}>
+                  {annotations.map((annotation, index) => (
+                    <View
+                      key={annotation.id}
+                      style={{
+                        flexDirection: 'row',
+                        alignItems: 'center',
+                        gap: 10,
+                        padding: 10,
+                        backgroundColor: theme.surface,
+                        borderRadius: 10,
+                      }}
+                    >
+                      <Text style={{ color: theme.textMuted, width: 24 }}>{index + 1}</Text>
+                      <Text style={{ color: theme.text, flex: 1 }} numberOfLines={1}>
+                        {annotation.product}
+                      </Text>
+                      <Pressable onPress={() => removeAnnotation(annotation.id)}>
+                        <Text style={{ color: '#ff6b6b', fontWeight: '700' }}>Remove</Text>
+                      </Pressable>
+                    </View>
+                  ))}
+                </View>
+              </View>
+            ) : (
+              <Text style={{ color: theme.textFaint, fontSize: 13, fontStyle: 'italic', marginTop: 16 }}>
+                No shelf image selected.
+              </Text>
+            )}
+
+            {!!status && <Text style={{ color: theme.textMuted, fontSize: 12, marginTop: 10 }}>{status}</Text>}
+
+            <Pressable
+              disabled={saving}
+              onPress={saveShelfAnnotations}
+              style={({ pressed }) => ({
+                marginTop: 16,
+                padding: 16,
+                borderRadius: 12,
+                alignItems: 'center',
+                backgroundColor: saving ? theme.surfaceAlt : pressed ? '#e7e7e9' : theme.accent,
+              })}
+            >
+              {saving ? (
+                <ActivityIndicator color={theme.text} />
+              ) : (
+                <Text style={{ color: theme.accentText, fontSize: 15, fontWeight: '700' }}>
+                  Save shelf labels
+                </Text>
+              )}
+            </Pressable>
+          </View>
+        )}
       </ScrollView>
     </View>
+  )
+}
+
+function ModeButton({
+  label,
+  onPress,
+  active,
+}: {
+  label: string
+  onPress: () => void
+  active?: boolean
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => ({
+        flex: 1,
+        paddingVertical: 12,
+        paddingHorizontal: 10,
+        borderRadius: 10,
+        alignItems: 'center',
+        backgroundColor: pressed ? '#26262a' : active ? theme.accent : theme.surface,
+        borderWidth: 1,
+        borderColor: active ? theme.accent : theme.border,
+      })}
+    >
+      <Text style={{ color: active ? theme.accentText : theme.text, fontSize: 13, fontWeight: '700' }}>
+        {label}
+      </Text>
+    </Pressable>
   )
 }
