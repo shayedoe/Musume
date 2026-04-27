@@ -14,7 +14,6 @@ import {
 import { useRouter, useLocalSearchParams } from 'expo-router'
 import * as Sharing from 'expo-sharing'
 import { File, Paths } from 'expo-file-system'
-import Svg, { Polygon as SvgPolygon } from 'react-native-svg'
 import { supabase } from '../lib/supabase'
 import { ensureCatalogSeeded } from '../lib/catalog'
 import { theme } from '../lib/theme'
@@ -36,6 +35,7 @@ interface ReviewPhoto {
   id?: string
   url: string
   annotations: BottleAnnotation[]
+  overlayUrl?: string
 }
 
 interface CorrectionTarget {
@@ -75,7 +75,7 @@ export default function Review() {
       {
         const { data, error } = await (supabase as any)
           .from('photos')
-          .select('id, image_url, annotations')
+          .select('id, image_url, annotations, overlay_url')
           .eq('session_id', session_id)
         if (error) {
           const fallback = await (supabase as any)
@@ -91,6 +91,7 @@ export default function Review() {
         id: p.id as string | undefined,
         url: p.image_url as string,
         annotations: Array.isArray(p.annotations) ? (p.annotations as BottleAnnotation[]) : [],
+        overlayUrl: typeof p.overlay_url === 'string' ? p.overlay_url : undefined,
       }))
       setPhotos(loadedPhotos)
 
@@ -408,6 +409,7 @@ export default function Review() {
                 <AnnotatedPhoto
                   key={`${p.url}-${i}`}
                   url={p.url}
+                  overlayUrl={p.overlayUrl}
                   annotations={p.annotations}
                   photoIndex={i}
                   onCorrect={openCorrection}
@@ -424,9 +426,7 @@ export default function Review() {
                   flexWrap: 'wrap',
                 }}
               >
-                <LegendDot color="#22c55e" label="Matched" />
-                <LegendDot color="#eab308" label="Identified" />
-                <LegendDot color="#ef4444" label="Unknown" />
+                <LegendDot color="#6b7280" label="Tap a bottle for details" />
               </View>
             )}
           </>
@@ -808,36 +808,34 @@ export default function Review() {
 
 // ---------- Annotated photo overlay ----------
 
-const STATUS_COLORS: Record<BottleAnnotation['status'], string> = {
-  matched: '#22c55e',
-  identified: '#eab308',
-  unknown: '#ef4444',
-}
-
 function AnnotatedPhoto({
   url,
+  overlayUrl,
   annotations,
   photoIndex,
   onCorrect,
 }: {
   url: string
+  overlayUrl?: string
   annotations: BottleAnnotation[]
   photoIndex: number
   onCorrect?: (photoIndex: number, annotationIndex: number, annotation: BottleAnnotation) => void
 }) {
   const [resolvedUrl, setResolvedUrl] = useState<string>(url)
   const [dims, setDims] = useState<{ w: number; h: number } | null>(null)
-  const [showOverlay, setShowOverlay] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [retried, setRetried] = useState(false)
   const [selected, setSelected] = useState<number | null>(null)
   const W = 300
   const H = 400
 
+  // The display image is Roboflow's overlay (bboxes + labels already drawn)
+  // if available, otherwise the original photo.
+  const displayUrl = overlayUrl ?? resolvedUrl
+
   // If the public URL fails (private bucket), fall back to a 1-hour signed URL.
   const trySignedUrl = useCallback(async (): Promise<string | null> => {
     try {
-      // public URL shape: <base>/storage/v1/object/public/<bucket>/<path>
       const m = url.match(/\/object\/public\/([^/]+)\/(.+)$/)
       if (!m) return null
       const [, bucket, path] = m
@@ -851,8 +849,6 @@ function AnnotatedPhoto({
     }
   }, [url])
 
-  // Eagerly fetch the image dimensions so the overlay aligns even if
-  // <Image onLoad> doesn't surface them on this platform.
   useEffect(() => {
     let cancelled = false
     Image.getSize(
@@ -865,7 +861,6 @@ function AnnotatedPhoto({
       },
       async (err) => {
         if (cancelled) return
-        // Auto-retry once with a signed URL in case the bucket is private.
         if (!retried) {
           setRetried(true)
           const signed = await trySignedUrl()
@@ -883,8 +878,7 @@ function AnnotatedPhoto({
     }
   }, [resolvedUrl, retried, trySignedUrl])
 
-  // Compute the visible rect of the image. We use `contain` so the full
-  // photo is always visible (no cropping), then letterbox the remainder.
+  // Compute the visible rect of the image so transparent bbox tap targets align.
   let scaleX = W, scaleY = H, offsetX = 0, offsetY = 0
   if (dims) {
     const scale = Math.min(W / dims.w, H / dims.h)
@@ -908,7 +902,7 @@ function AnnotatedPhoto({
       }}
     >
       <Image
-        source={{ uri: resolvedUrl }}
+        source={{ uri: displayUrl }}
         style={{ width: W, height: H }}
         resizeMode="contain"
         onLoad={(e) => {
@@ -918,7 +912,6 @@ function AnnotatedPhoto({
           }
         }}
         onError={async (e) => {
-          // Same private-bucket fallback as Image.getSize.
           if (!retried) {
             setRetried(true)
             const signed = await trySignedUrl()
@@ -930,118 +923,31 @@ function AnnotatedPhoto({
           setLoadError(String(e?.nativeEvent?.error ?? 'image failed to load'))
         }}
       />
-      {showOverlay && (
-        <>
-          {/* Real SAM3 segmentation masks (when the backend returns polygons). */}
-          <Svg
-            width={W}
-            height={H}
-            style={{ position: 'absolute', left: 0, top: 0 }}
-            pointerEvents="none"
-          >
-            {annotations.map((a, i) => {
-              if (!a.polygon || a.polygon.length < 3) return null
-              const color = STATUS_COLORS[a.status] ?? STATUS_COLORS.unknown
-              const points = a.polygon
-                .map(([px, py]) => `${offsetX + px * scaleX},${offsetY + py * scaleY}`)
-                .join(' ')
-              return (
-                <SvgPolygon
-                  key={`mask-${i}`}
-                  points={points}
-                  fill={color}
-                  fillOpacity={0.35}
-                  stroke={color}
-                  strokeWidth={2}
-                />
-              )
-            })}
-          </Svg>
-          {annotations.map((a, i) => {
-            const [bx, by, bw, bh] = a.bbox
-            const left = offsetX + bx * scaleX
-            const top = offsetY + by * scaleY
-            const width = bw * scaleX
-            const height = bh * scaleY
-            const color = STATUS_COLORS[a.status] ?? STATUS_COLORS.unknown
-            const hasMask = !!(a.polygon && a.polygon.length >= 3)
-            // When we have a real mask, the Pressable is just a transparent
-            // hit area over the bbox. Otherwise we draw the bottle silhouette
-            // (neck + body) so each detection still looks like a bottle.
-            if (hasMask) {
-              return (
-                <Pressable
-                  key={i}
-                  onPress={() => setSelected(i)}
-                  style={{
-                    position: 'absolute',
-                    left,
-                    top,
-                    width,
-                    height,
-                    backgroundColor: 'transparent',
-                  }}
-                />
-              )
-            }
-            const neckW = Math.max(4, width * 0.32)
-            const neckH = Math.max(4, height * 0.18)
-            const bodyTop = neckH * 0.78
-            const bodyH = height - bodyTop
-            const bodyRadius = Math.min(width * 0.45, height * 0.18, 18)
-            return (
-              <Pressable
-                key={i}
-                onPress={() => setSelected(i)}
-                style={{
-                  position: 'absolute',
-                  left,
-                  top,
-                  width,
-                  height,
-                  backgroundColor: 'transparent',
-                }}
-              >
-                <View
-                  pointerEvents="none"
-                  style={{
-                    position: 'absolute',
-                    left: (width - neckW) / 2,
-                    top: 0,
-                    width: neckW,
-                    height: neckH,
-                    borderTopLeftRadius: neckW * 0.35,
-                    borderTopRightRadius: neckW * 0.35,
-                    borderWidth: 2,
-                    borderColor: color,
-                    backgroundColor: color,
-                    opacity: 0.85,
-                  }}
-                />
-                <View
-                  pointerEvents="none"
-                  style={{
-                    position: 'absolute',
-                    left: 0,
-                    top: bodyTop,
-                    width,
-                    height: bodyH,
-                    borderTopLeftRadius: bodyRadius * 1.4,
-                    borderTopRightRadius: bodyRadius * 1.4,
-                    borderBottomLeftRadius: bodyRadius,
-                    borderBottomRightRadius: bodyRadius,
-                    borderWidth: 2,
-                    borderColor: color,
-                    backgroundColor: color,
-                    opacity: 0.35,
-                  }}
-                />
-              </Pressable>
-            )
-          })}
-        </>
-      )}
-      {/* Popup: tap a bottle, see its identity; tap backdrop to dismiss. */}
+
+      {/* Transparent tap targets over each bbox so the popup still works. */}
+      {annotations.map((a, i) => {
+        const [bx, by, bw, bh] = a.bbox
+        const left = offsetX + bx * scaleX
+        const top = offsetY + by * scaleY
+        const width = bw * scaleX
+        const height = bh * scaleY
+        return (
+          <Pressable
+            key={i}
+            onPress={() => setSelected(i)}
+            style={{
+              position: 'absolute',
+              left,
+              top,
+              width,
+              height,
+              backgroundColor: 'transparent',
+            }}
+          />
+        )
+      })}
+
+      {/* Popup: tap a bottle to see its identity. */}
       {selected !== null && annotations[selected] && (
         <Pressable
           onPress={() => setSelected(null)}
@@ -1064,9 +970,7 @@ function AnnotatedPhoto({
               padding: 14,
               maxWidth: W - 24,
               borderWidth: 2,
-              borderColor:
-                STATUS_COLORS[annotations[selected].status] ??
-                STATUS_COLORS.unknown,
+              borderColor: '#22c55e',
             }}
           >
             <Text
@@ -1104,36 +1008,8 @@ function AnnotatedPhoto({
           </View>
         </Pressable>
       )}
-      {/* Toggle overlay by tapping empty background area (only when no popup). */}
-      {selected === null && (
-        <Pressable
-          onPress={() => setShowOverlay((v) => !v)}
-          style={{
-            position: 'absolute',
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-            zIndex: -1,
-          }}
-        />
-      )}
-      {loadError && (
-        <View
-          style={{
-            position: 'absolute',
-            left: 0,
-            right: 0,
-            bottom: 0,
-            backgroundColor: 'rgba(0,0,0,0.75)',
-            padding: 6,
-          }}
-        >
-          <Text style={{ color: '#fca5a5', fontSize: 10 }} numberOfLines={2}>
-            {loadError}
-          </Text>
-        </View>
-      )}
+
+      {/* Badge showing bottle count. */}
       {annotations.length > 0 && (
         <View
           style={{
@@ -1147,7 +1023,24 @@ function AnnotatedPhoto({
           }}
         >
           <Text style={{ color: '#fff', fontSize: 10, fontWeight: '600' }}>
-            {showOverlay ? `${annotations.length} ${annotations.length === 1 ? 'bottle' : 'bottles'}` : 'tap to show'}
+            {annotations.length} {annotations.length === 1 ? 'bottle' : 'bottles'}
+          </Text>
+        </View>
+      )}
+
+      {loadError && (
+        <View
+          style={{
+            position: 'absolute',
+            left: 0,
+            right: 0,
+            bottom: 0,
+            backgroundColor: 'rgba(0,0,0,0.75)',
+            padding: 6,
+          }}
+        >
+          <Text style={{ color: '#fca5a5', fontSize: 10 }} numberOfLines={2}>
+            {loadError}
           </Text>
         </View>
       )}

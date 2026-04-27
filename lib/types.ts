@@ -72,6 +72,9 @@ export interface VisionAnalysisResponse {
   annotations?: BottleAnnotation[]
   warnings?: string[]
   meta?: Record<string, unknown>
+  // Roboflow's server-rendered overlay image (bboxes + labels already drawn).
+  // When present, the app shows this directly instead of drawing its own overlays.
+  visual_overlay?: string
 }
 
 export interface Database {

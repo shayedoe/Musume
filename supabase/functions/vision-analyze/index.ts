@@ -800,6 +800,7 @@ async function runRoboflowWorkflowApi(
   detections: WorkflowPrediction[]
   imageWidth: number
   imageHeight: number
+  visualOverlay?: string
   raw: any
 }> {
   const url = `https://detect.roboflow.com/infer/workflows/${ROBOFLOW_WORKSPACE}/${ROBOFLOW_WORKFLOW}`
@@ -876,7 +877,23 @@ async function runRoboflowWorkflowApi(
     return true
   })
 
-  return { detections, imageWidth, imageHeight, raw }
+  // Extract Roboflow's rendered overlay image from workflow outputs.
+  // The visualization blocks return { type: "base64", value: "..." }.
+  let visualOverlay: string | undefined
+  if (Array.isArray(raw?.outputs)) {
+    for (const o of raw.outputs) {
+      if (!o?.visual_overlay) continue
+      const vo = o.visual_overlay
+      if (typeof vo === 'string' && vo.length > 0) {
+        visualOverlay = vo.startsWith('data:') ? vo : `data:image/jpeg;base64,${vo}`
+      } else if (vo?.type === 'base64' && typeof vo.value === 'string' && vo.value.length > 0) {
+        visualOverlay = `data:image/jpeg;base64,${vo.value}`
+      }
+      if (visualOverlay) break
+    }
+  }
+
+  return { detections, imageWidth, imageHeight, visualOverlay, raw }
 }
 
 function workflowProductLabel(p: WorkflowPrediction): string {
@@ -921,8 +938,9 @@ async function detectWithRoboflowWorkflow(
   }>
   warnings: string[]
   meta: Record<string, unknown>
+  visual_overlay?: string
 }> {
-  const { detections: preds, imageWidth, imageHeight, raw } =
+  const { detections: preds, imageWidth, imageHeight, visualOverlay, raw } =
     await runRoboflowWorkflowApi(imageBase64)
 
   let imgW = imageWidth
@@ -998,6 +1016,7 @@ async function detectWithRoboflowWorkflow(
       with_polygons: finalBottles.filter((b) => b.polygon).length,
       output_blocks: Array.isArray(raw?.outputs) ? raw.outputs.length : 0,
     },
+    ...(visualOverlay ? { visual_overlay: visualOverlay } : {}),
   }
 }
 

@@ -270,6 +270,7 @@ export async function analyzeShelfImage(
     annotations,
     warnings: Array.isArray(raw?.warnings) ? raw.warnings.map(String) : [],
     meta: raw?.meta && typeof raw.meta === 'object' ? raw.meta : undefined,
+    visual_overlay: typeof raw?.visual_overlay === 'string' ? raw.visual_overlay : undefined,
   }
 }
 
