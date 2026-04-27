@@ -1,4 +1,7 @@
 // deno-lint-ignore-file no-explicit-any
+// @ts-nocheck — this file targets the Deno runtime; VS Code's Node TS server
+// doesn't know about Deno globals or jsr:/https: imports. Deno's own
+// typechecker validates the file at deploy time.
 import 'jsr:@supabase/functions-js/edge-runtime.d.ts'
 import { decode, Image } from 'https://deno.land/x/imagescript@1.2.17/mod.ts'
 
